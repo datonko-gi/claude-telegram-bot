@@ -91,9 +91,17 @@ Valid lead statuses: NEW, OPEN, IN_PROGRESS, OPEN_DEAL, UNQUALIFIED, ATTEMPTED_T
 CRITICAL RULES:
 - NEVER say "I updated HubSpot" or "Card updated" or "Обновляю карточку" — you CANNOT update HubSpot directly. Only the system can, after Daniel clicks the confirmation button.
 - Instead say "Here's what I suggest updating:" and include the tags above.
-- If Daniel says "да" or "обнови" to confirm a previous suggestion, remind him to click the button, or include new tags so the system creates new buttons.
+- If Daniel says "да" or "обнови" to confirm, remind him to click the button, or include new tags.
 - If the message is a normal question not related to CRM/leads, respond normally WITHOUT any hubspot tags.
+- The /find command works independently — it searches HubSpot directly without needing you.
 """
+
+
+def esc(text):
+    """Escape HTML special characters."""
+    if not text:
+        return ""
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 # === HUBSPOT API FUNCTIONS ===
@@ -108,18 +116,24 @@ def hubspot_request(method, endpoint, data=None):
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req) as resp:
-            return json.loads(resp.read().decode())
+            result = json.loads(resp.read().decode())
+            logger.info(f"HubSpot {method} {endpoint}: OK")
+            return result
     except urllib.error.HTTPError as e:
         error_body = e.read().decode() if e.fp else ""
-        logger.error(f"HubSpot API error {e.code}: {error_body}")
+        logger.error(f"HubSpot API error {e.code} for {method} {endpoint}: {error_body}")
         return {"error": e.code, "message": error_body}
     except Exception as e:
-        logger.error(f"HubSpot request failed: {e}")
+        logger.error(f"HubSpot request failed for {method} {endpoint}: {e}")
         return {"error": str(e)}
 
 
 def search_contact_by_telegram(tg_username):
-    tg_username_clean = tg_username.lower().lstrip("@")
+    """Search HubSpot contact by Telegram username. Tries multiple methods."""
+    tg_username_clean = tg_username.lower().strip().lstrip("@")
+    logger.info(f"Searching for contact with telegram: {tg_username_clean}")
+
+    # Method 1: CONTAINS_TOKEN on website field
     data = {
         "filterGroups": [{
             "filters": [{
@@ -136,8 +150,35 @@ def search_contact_by_telegram(tg_username):
     }
     result = hubspot_request("POST", "/crm/v3/objects/contacts/search", data)
     if result and "results" in result and result["results"]:
+        logger.info(f"Found {len(result['results'])} contacts via CONTAINS_TOKEN")
         return result["results"]
 
+    # Method 2: EQ with full URL variations
+    for url_pattern in [
+        f"https://t.me/{tg_username_clean}",
+        f"http://t.me/{tg_username_clean}",
+        f"t.me/{tg_username_clean}",
+    ]:
+        data = {
+            "filterGroups": [{
+                "filters": [{
+                    "propertyName": "website",
+                    "operator": "EQ",
+                    "value": url_pattern,
+                }]
+            }],
+            "properties": [
+                "firstname", "lastname", "email", "phone",
+                "lifecyclestage", "hs_lead_status", "website",
+            ],
+            "limit": 5,
+        }
+        result = hubspot_request("POST", "/crm/v3/objects/contacts/search", data)
+        if result and "results" in result and result["results"]:
+            logger.info(f"Found {len(result['results'])} contacts via EQ '{url_pattern}'")
+            return result["results"]
+
+    # Method 3: Fulltext search
     data = {
         "query": tg_username_clean,
         "properties": [
@@ -147,8 +188,27 @@ def search_contact_by_telegram(tg_username):
         "limit": 5,
     }
     result = hubspot_request("POST", "/crm/v3/objects/contacts/search", data)
-    if result and "results" in result:
+    if result and "results" in result and result["results"]:
+        logger.info(f"Found {len(result['results'])} contacts via fulltext")
         return result["results"]
+
+    # Method 4: Name search if username has underscores
+    if "_" in tg_username_clean:
+        name_query = tg_username_clean.replace("_", " ")
+        data = {
+            "query": name_query,
+            "properties": [
+                "firstname", "lastname", "email", "phone",
+                "lifecyclestage", "hs_lead_status", "website",
+            ],
+            "limit": 5,
+        }
+        result = hubspot_request("POST", "/crm/v3/objects/contacts/search", data)
+        if result and "results" in result and result["results"]:
+            logger.info(f"Found {len(result['results'])} contacts via name search")
+            return result["results"]
+
+    logger.warning(f"No contacts found for '{tg_username_clean}'")
     return []
 
 
@@ -214,9 +274,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Команды:\n"
         "/reset — очистить историю\n"
         "/model — текущая модель\n"
-        "/setmodel <model> — сменить модель\n"
-        "/find <username> — найти контакт\n\n"
-        "Перешли переписку с клиентом или опиши результат разговора — я предложу обновления в HubSpot."
+        "/setmodel — сменить модель\n"
+        "/find username — найти контакт\n"
+        "/debug — проверить подключение к HubSpot\n\n"
+        "Перешли переписку с клиентом — я предложу обновления в HubSpot."
     )
 
 
@@ -229,10 +290,44 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("История очищена.")
 
 
+async def debug_hubspot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.username):
+        return
+
+    await update.message.reply_text("Тестирую подключение к HubSpot...")
+
+    if not HUBSPOT_API_KEY:
+        await update.message.reply_text("HUBSPOT_API_KEY не установлен!")
+        return
+
+    key_preview = HUBSPOT_API_KEY[:8] + "..." + HUBSPOT_API_KEY[-4:]
+
+    data = {
+        "query": "test",
+        "properties": ["firstname", "lastname", "email"],
+        "limit": 1,
+    }
+    result = hubspot_request("POST", "/crm/v3/objects/contacts/search", data)
+
+    if "error" in result:
+        await update.message.reply_text(
+            f"HubSpot ОШИБКА!\n\n"
+            f"Ключ: {key_preview}\n"
+            f"Ошибка: {result.get('error')} — {result.get('message', '')[:200]}"
+        )
+    else:
+        total = result.get("total", "?")
+        await update.message.reply_text(
+            f"HubSpot подключен!\n\n"
+            f"Ключ: {key_preview}\n"
+            f"Контактов в базе: {total}"
+        )
+
+
 async def model_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.username):
         return
-    await update.message.reply_text(f"Текущая модель: `{MODEL}`", parse_mode="Markdown")
+    await update.message.reply_text(f"Текущая модель: {MODEL}")
 
 
 async def set_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -241,14 +336,13 @@ async def set_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global MODEL
     if context.args:
         MODEL = context.args[0]
-        await update.message.reply_text(f"Модель изменена: `{MODEL}`", parse_mode="Markdown")
+        await update.message.reply_text(f"Модель изменена: {MODEL}")
     else:
         await update.message.reply_text(
             "Укажи модель:\n"
-            "`/setmodel claude-sonnet-4-20250514`\n"
-            "`/setmodel claude-opus-4-20250514`\n"
-            "`/setmodel claude-haiku-4-20250506`",
-            parse_mode="Markdown",
+            "/setmodel claude-sonnet-4-20250514\n"
+            "/setmodel claude-opus-4-20250514\n"
+            "/setmodel claude-haiku-4-20250506"
         )
 
 
@@ -256,15 +350,18 @@ async def find_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.username):
         return
     if not context.args:
-        await update.message.reply_text("Укажи username: `/find username`", parse_mode="Markdown")
+        await update.message.reply_text("Укажи username: /find username")
         return
 
     username = context.args[0].lstrip("@")
-    await update.message.reply_text(f"Ищу {username} в HubSpot...")
+    msg = await update.message.reply_text(f"Ищу {username} в HubSpot...")
 
     contacts = search_contact_by_telegram(username)
     if not contacts:
-        await update.message.reply_text(f"Контакт @{username} не найден.")
+        await msg.edit_text(
+            f"Контакт {username} не найден.\n\n"
+            f"Проверь подключение: /debug"
+        )
         return
 
     for c in contacts:
@@ -276,17 +373,18 @@ async def find_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         email = props.get("email", "—")
         phone = props.get("phone", "—")
         cid = c["id"]
+        link = f"https://app.hubspot.com/contacts/47345195/record/0-1/{cid}"
 
         text = (
-            f"*{name}*\n"
-            f"Email: {email}\n"
-            f"Phone: {phone}\n"
-            f"Web: {website}\n"
-            f"Stage: {stage}\n"
-            f"Status: {status}\n"
-            f"[HubSpot](https://app.hubspot.com/contacts/47345195/record/0-1/{cid})"
+            f"<b>{esc(name)}</b>\n"
+            f"Email: {esc(email)}\n"
+            f"Phone: {esc(phone)}\n"
+            f"Web: {esc(website)}\n"
+            f"Stage: {esc(stage)}\n"
+            f"Status: {esc(status)}\n"
+            f'<a href="{link}">Открыть в HubSpot</a>'
         )
-        await update.message.reply_text(text, parse_mode="Markdown", disable_web_page_preview=True)
+        await update.message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -332,7 +430,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply = response.content[0].text
         conversations[chat_id].append({"role": "assistant", "content": reply})
 
-        # Check if Claude suggested a HubSpot update
         hs_update = extract_hubspot_update(reply)
         tg_username = extract_hubspot_contact(reply) or fwd_username
         clean_reply = clean_response(reply)
@@ -352,13 +449,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 new_status = LEAD_STATUSES.get(hs_update.get("suggested_lead_status", ""), "—")
 
                 update_text = (
-                    f"{clean_reply}\n\n"
+                    f"{esc(clean_reply)}\n\n"
                     f"━━━━━━━━━━━━━━━\n"
-                    f"*HubSpot: {name}*\n\n"
-                    f"Stage: {current_stage} → *{new_stage}*\n"
-                    f"Status: {current_status} → *{new_status}*\n"
-                    f"Заметка: {hs_update.get('suggested_note', '—')}\n\n"
-                    f"*Нажми кнопку:*"
+                    f"<b>HubSpot: {esc(name)}</b>\n\n"
+                    f"Stage: {esc(current_stage)} → <b>{esc(new_stage)}</b>\n"
+                    f"Status: {esc(current_status)} → <b>{esc(new_status)}</b>\n"
+                    f"Заметка: {esc(hs_update.get('suggested_note', '—'))}\n\n"
+                    f"<b>Нажми кнопку:</b>"
                 )
 
                 pending_updates[chat_id] = {
@@ -382,20 +479,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 await update.message.reply_text(
                     update_text,
-                    parse_mode="Markdown",
+                    parse_mode="HTML",
                     reply_markup=InlineKeyboardMarkup(keyboard),
                 )
             else:
                 await update.message.reply_text(
                     f"{clean_reply}\n\n"
-                    f"⚠️ Контакт @{tg_username} не найден в HubSpot.\n"
-                    f"/find {tg_username}",
+                    f"Контакт {tg_username} не найден в HubSpot.\n"
+                    f"Проверь: /find {tg_username}\nИли: /debug",
                 )
         elif hs_update and not tg_username:
             await update.message.reply_text(
                 f"{clean_reply}\n\n"
-                f"⚠️ Не могу определить Telegram username контакта. Укажи его, например:\n"
-                f"\"обнови @username — договорились о звонке\"",
+                f"Не могу определить username контакта.\n"
+                f'Укажи его: "обнови @username — договорились о звонке"',
             )
         else:
             if len(clean_reply) <= 4096:
@@ -417,11 +514,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending = pending_updates.get(chat_id)
 
     if not pending:
-        await query.edit_message_text("⚠️ Нет активного обновления.")
+        await query.edit_message_text("Нет активного обновления.")
         return
 
     cid = pending["contact_id"]
     name = pending["contact_name"]
+    link = f"https://app.hubspot.com/contacts/47345195/record/0-1/{cid}"
 
     if query.data == "hs_confirm":
         props = {}
@@ -439,30 +537,30 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             stage_label = LIFECYCLE_STAGES.get(pending.get("lifecycle", ""), "—")
             status_label = LEAD_STATUSES.get(pending.get("lead_status", ""), "—")
             await query.edit_message_text(
-                f"✅ *{name}* обновлён!\n\n"
-                f"Stage → {stage_label}\n"
-                f"Status → {status_label}\n"
+                f"✅ <b>{esc(name)}</b> обновлён!\n\n"
+                f"Stage → {esc(stage_label)}\n"
+                f"Status → {esc(status_label)}\n"
                 f"Заметка добавлена\n\n"
-                f"[Открыть в HubSpot](https://app.hubspot.com/contacts/47345195/record/0-1/{cid})",
-                parse_mode="Markdown",
+                f'<a href="{link}">Открыть в HubSpot</a>',
+                parse_mode="HTML",
                 disable_web_page_preview=True,
             )
         else:
             error = result.get("message", "") or note_result.get("message", "")
-            await query.edit_message_text(f"❌ Ошибка: {error}")
+            await query.edit_message_text(f"Ошибка: {error[:500]}")
 
     elif query.data == "hs_note_only":
         if pending.get("note"):
             result = add_note_to_contact(cid, pending["note"])
             if "error" not in result:
                 await query.edit_message_text(
-                    f"📝 Заметка добавлена для *{name}*\n\n"
-                    f"[HubSpot](https://app.hubspot.com/contacts/47345195/record/0-1/{cid})",
-                    parse_mode="Markdown",
+                    f"📝 Заметка добавлена для <b>{esc(name)}</b>\n\n"
+                    f'<a href="{link}">Открыть в HubSpot</a>',
+                    parse_mode="HTML",
                     disable_web_page_preview=True,
                 )
             else:
-                await query.edit_message_text(f"❌ Ошибка: {result.get('message', '')}")
+                await query.edit_message_text(f"Ошибка: {result.get('message', '')[:500]}")
         else:
             await query.edit_message_text("Нет заметки.")
 
@@ -479,15 +577,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 stage_label = LIFECYCLE_STAGES.get(pending.get("lifecycle", ""), "—")
                 status_label = LEAD_STATUSES.get(pending.get("lead_status", ""), "—")
                 await query.edit_message_text(
-                    f"📊 Статус обновлён: *{name}*\n\n"
-                    f"Stage → {stage_label}\n"
-                    f"Status → {status_label}\n\n"
-                    f"[HubSpot](https://app.hubspot.com/contacts/47345195/record/0-1/{cid})",
-                    parse_mode="Markdown",
+                    f"📊 Статус обновлён: <b>{esc(name)}</b>\n\n"
+                    f"Stage → {esc(stage_label)}\n"
+                    f"Status → {esc(status_label)}\n\n"
+                    f'<a href="{link}">Открыть в HubSpot</a>',
+                    parse_mode="HTML",
                     disable_web_page_preview=True,
                 )
             else:
-                await query.edit_message_text(f"❌ Ошибка: {result.get('message', '')}")
+                await query.edit_message_text(f"Ошибка: {result.get('message', '')[:500]}")
         else:
             await query.edit_message_text("Нет данных для обновления.")
 
@@ -501,6 +599,7 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("debug", debug_hubspot))
     app.add_handler(CommandHandler("model", model_info))
     app.add_handler(CommandHandler("setmodel", set_model))
     app.add_handler(CommandHandler("find", find_contact))
@@ -508,6 +607,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info(f"Bot started with HubSpot integration. Model: {MODEL}")
+    logger.info(f"HubSpot key: {HUBSPOT_API_KEY[:8]}...{HUBSPOT_API_KEY[-4:] if HUBSPOT_API_KEY else 'NOT SET'}")
     app.run_polling()
 
 
