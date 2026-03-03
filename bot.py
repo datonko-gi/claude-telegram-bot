@@ -3,6 +3,9 @@ import re
 import json
 import logging
 import time
+import tempfile
+import csv
+import io
 from collections import defaultdict
 from anthropic import Anthropic
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -64,6 +67,9 @@ SYSTEM_PROMPT = """You are a personal AI assistant for Daniel (Danil) Tonkopiy.
 - Responds in the same language Daniel writes in.
 - Keep messages concise for Telegram.
 
+== FILE HANDLING ==
+When Daniel sends you files (xlsx, csv, txt), the system will extract the content and include it in the message. You CAN see file contents — acknowledge them and work with the data.
+
 == HUBSPOT INTEGRATION ==
 You have access to HubSpot CRM. When Daniel shares or forwards a conversation with a lead, or mentions updating a contact:
 
@@ -102,6 +108,69 @@ def esc(text):
     if not text:
         return ""
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+# === FILE PARSING ===
+
+def parse_xlsx(file_path):
+    """Parse xlsx file and return text representation."""
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+        result = []
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            rows = list(ws.iter_rows(values_only=True))
+            if not rows:
+                continue
+            result.append(f"=== Sheet: {sheet_name} ===")
+            for row in rows[:500]:  # Limit to 500 rows
+                cells = [str(c) if c is not None else "" for c in row]
+                result.append(" | ".join(cells))
+        wb.close()
+        text = "\n".join(result)
+        # Truncate if too long
+        if len(text) > 30000:
+            text = text[:30000] + "\n... (truncated)"
+        return text
+    except Exception as e:
+        logger.error(f"Failed to parse xlsx: {e}")
+        return f"[Error reading xlsx: {e}]"
+
+
+def parse_csv(file_path):
+    """Parse csv file and return text representation."""
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read(50000)  # Limit size
+        return text
+    except Exception as e:
+        logger.error(f"Failed to parse csv: {e}")
+        return f"[Error reading csv: {e}]"
+
+
+def parse_text(file_path):
+    """Parse text file and return content."""
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read(50000)
+        return text
+    except Exception as e:
+        logger.error(f"Failed to parse text: {e}")
+        return f"[Error reading file: {e}]"
+
+
+def parse_file(file_path, file_name):
+    """Parse file based on extension."""
+    name_lower = file_name.lower()
+    if name_lower.endswith(".xlsx") or name_lower.endswith(".xls"):
+        return parse_xlsx(file_path)
+    elif name_lower.endswith(".csv"):
+        return parse_csv(file_path)
+    elif name_lower.endswith(".txt") or name_lower.endswith(".md") or name_lower.endswith(".json"):
+        return parse_text(file_path)
+    else:
+        return f"[Unsupported file type: {file_name}. Supported: xlsx, csv, txt, md, json]"
 
 
 # === HUBSPOT API FUNCTIONS ===
@@ -277,7 +346,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/setmodel — сменить модель\n"
         "/find username — найти контакт\n"
         "/debug — проверить подключение к HubSpot\n\n"
-        "Перешли переписку с клиентом — я предложу обновления в HubSpot."
+        "Можно:\n"
+        "- Переслать переписку с клиентом\n"
+        "- Отправить файл (xlsx, csv, txt)\n"
+        "- Задать любой вопрос"
     )
 
 
@@ -303,7 +375,7 @@ async def debug_hubspot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key_preview = HUBSPOT_API_KEY[:8] + "..." + HUBSPOT_API_KEY[-4:]
 
     data = {
-        "query": "test",
+        "query": "a",
         "properties": ["firstname", "lastname", "email"],
         "limit": 1,
     }
@@ -320,7 +392,7 @@ async def debug_hubspot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"HubSpot подключен!\n\n"
             f"Ключ: {key_preview}\n"
-            f"Контактов в базе: {total}"
+            f"Контактов найдено: {total}"
         )
 
 
@@ -359,7 +431,7 @@ async def find_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     contacts = search_contact_by_telegram(username)
     if not contacts:
         await msg.edit_text(
-            f"Контакт {username} не найден.\n\n"
+            f"Контакт {username} не найден.\n"
             f"Проверь подключение: /debug"
         )
         return
@@ -387,6 +459,77 @@ async def find_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
 
 
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle file uploads - download, parse, and send content to Claude."""
+    if not is_allowed(update.effective_user.username):
+        return
+
+    chat_id = update.effective_chat.id
+    doc = update.message.document
+    caption = update.message.caption or ""
+
+    if not doc:
+        return
+
+    file_name = doc.file_name or "unknown"
+    file_size = doc.file_size or 0
+
+    # Limit: 10MB
+    if file_size > 10 * 1024 * 1024:
+        await update.message.reply_text("Файл слишком большой (макс 10MB).")
+        return
+
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+
+    try:
+        # Download file
+        tg_file = await doc.get_file()
+        with tempfile.NamedTemporaryFile(suffix=f"_{file_name}", delete=False) as tmp:
+            tmp_path = tmp.name
+            await tg_file.download_to_drive(tmp_path)
+
+        logger.info(f"Downloaded file: {file_name} ({file_size} bytes) to {tmp_path}")
+
+        # Parse file
+        file_content = parse_file(tmp_path, file_name)
+
+        # Clean up
+        os.unlink(tmp_path)
+
+        # Build message for Claude
+        msg_text = f"[FILE: {file_name}]\n{file_content}"
+        if caption:
+            msg_text += f"\n\n[User message]: {caption}"
+
+        conversations[chat_id].append({"role": "user", "content": msg_text})
+
+        if len(conversations[chat_id]) > MAX_HISTORY:
+            conversations[chat_id] = conversations[chat_id][-MAX_HISTORY:]
+
+        # Send to Claude
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=4096,
+            system=SYSTEM_PROMPT,
+            messages=conversations[chat_id],
+        )
+        reply = response.content[0].text
+        conversations[chat_id].append({"role": "assistant", "content": reply})
+
+        hs_update = extract_hubspot_update(reply)
+        tg_username = extract_hubspot_contact(reply)
+        clean_reply = clean_response(reply)
+
+        if hs_update and tg_username:
+            await _send_hubspot_update(update, chat_id, hs_update, tg_username, clean_reply)
+        else:
+            await _send_reply(update, clean_reply)
+
+    except Exception as e:
+        logger.error(f"Error handling document: {e}")
+        await update.message.reply_text(f"Ошибка при обработке файла: {e}")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.username):
         return
@@ -397,11 +540,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Detect forwarded messages
-    is_forwarded = False
     fwd_username = None
     try:
         if update.message.forward_origin is not None:
-            is_forwarded = True
             origin = update.message.forward_origin
             if hasattr(origin, "sender_user") and origin.sender_user:
                 u = origin.sender_user
@@ -435,59 +576,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clean_reply = clean_response(reply)
 
         if hs_update and tg_username:
-            contacts = search_contact_by_telegram(tg_username)
-
-            if contacts:
-                contact = contacts[0]
-                props = contact.get("properties", {})
-                name = f"{props.get('firstname', '')} {props.get('lastname', '')}".strip() or tg_username
-                cid = contact["id"]
-
-                current_stage = LIFECYCLE_STAGES.get(props.get("lifecyclestage", ""), "—")
-                current_status = LEAD_STATUSES.get(props.get("hs_lead_status", ""), "—")
-                new_stage = LIFECYCLE_STAGES.get(hs_update.get("suggested_lifecycle", ""), "—")
-                new_status = LEAD_STATUSES.get(hs_update.get("suggested_lead_status", ""), "—")
-
-                update_text = (
-                    f"{esc(clean_reply)}\n\n"
-                    f"━━━━━━━━━━━━━━━\n"
-                    f"<b>HubSpot: {esc(name)}</b>\n\n"
-                    f"Stage: {esc(current_stage)} → <b>{esc(new_stage)}</b>\n"
-                    f"Status: {esc(current_status)} → <b>{esc(new_status)}</b>\n"
-                    f"Заметка: {esc(hs_update.get('suggested_note', '—'))}\n\n"
-                    f"<b>Нажми кнопку:</b>"
-                )
-
-                pending_updates[chat_id] = {
-                    "contact_id": cid,
-                    "contact_name": name,
-                    "lifecycle": hs_update.get("suggested_lifecycle"),
-                    "lead_status": hs_update.get("suggested_lead_status"),
-                    "note": hs_update.get("suggested_note"),
-                }
-
-                keyboard = [
-                    [
-                        InlineKeyboardButton("✅ Обновить всё", callback_data="hs_confirm"),
-                        InlineKeyboardButton("❌ Отмена", callback_data="hs_cancel"),
-                    ],
-                    [
-                        InlineKeyboardButton("📝 Только заметку", callback_data="hs_note_only"),
-                        InlineKeyboardButton("📊 Только статус", callback_data="hs_status_only"),
-                    ]
-                ]
-
-                await update.message.reply_text(
-                    update_text,
-                    parse_mode="HTML",
-                    reply_markup=InlineKeyboardMarkup(keyboard),
-                )
-            else:
-                await update.message.reply_text(
-                    f"{clean_reply}\n\n"
-                    f"Контакт {tg_username} не найден в HubSpot.\n"
-                    f"Проверь: /find {tg_username}\nИли: /debug",
-                )
+            await _send_hubspot_update(update, chat_id, hs_update, tg_username, clean_reply)
         elif hs_update and not tg_username:
             await update.message.reply_text(
                 f"{clean_reply}\n\n"
@@ -495,15 +584,77 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f'Укажи его: "обнови @username — договорились о звонке"',
             )
         else:
-            if len(clean_reply) <= 4096:
-                await update.message.reply_text(clean_reply)
-            else:
-                for i in range(0, len(clean_reply), 4096):
-                    await update.message.reply_text(clean_reply[i:i + 4096])
+            await _send_reply(update, clean_reply)
 
     except Exception as e:
         logger.error(f"Error: {e}")
         await update.message.reply_text(f"Ошибка: {e}")
+
+
+async def _send_reply(update, text):
+    """Send text reply, splitting if needed."""
+    if len(text) <= 4096:
+        await update.message.reply_text(text)
+    else:
+        for i in range(0, len(text), 4096):
+            await update.message.reply_text(text[i:i + 4096])
+
+
+async def _send_hubspot_update(update, chat_id, hs_update, tg_username, clean_reply):
+    """Search contact and show update buttons."""
+    contacts = search_contact_by_telegram(tg_username)
+
+    if contacts:
+        contact = contacts[0]
+        props = contact.get("properties", {})
+        name = f"{props.get('firstname', '')} {props.get('lastname', '')}".strip() or tg_username
+        cid = contact["id"]
+
+        current_stage = LIFECYCLE_STAGES.get(props.get("lifecyclestage", ""), "—")
+        current_status = LEAD_STATUSES.get(props.get("hs_lead_status", ""), "—")
+        new_stage = LIFECYCLE_STAGES.get(hs_update.get("suggested_lifecycle", ""), "—")
+        new_status = LEAD_STATUSES.get(hs_update.get("suggested_lead_status", ""), "—")
+
+        update_text = (
+            f"{esc(clean_reply)}\n\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"<b>HubSpot: {esc(name)}</b>\n\n"
+            f"Stage: {esc(current_stage)} → <b>{esc(new_stage)}</b>\n"
+            f"Status: {esc(current_status)} → <b>{esc(new_status)}</b>\n"
+            f"Заметка: {esc(hs_update.get('suggested_note', '—'))}\n\n"
+            f"<b>Нажми кнопку:</b>"
+        )
+
+        pending_updates[chat_id] = {
+            "contact_id": cid,
+            "contact_name": name,
+            "lifecycle": hs_update.get("suggested_lifecycle"),
+            "lead_status": hs_update.get("suggested_lead_status"),
+            "note": hs_update.get("suggested_note"),
+        }
+
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Обновить всё", callback_data="hs_confirm"),
+                InlineKeyboardButton("❌ Отмена", callback_data="hs_cancel"),
+            ],
+            [
+                InlineKeyboardButton("📝 Только заметку", callback_data="hs_note_only"),
+                InlineKeyboardButton("📊 Только статус", callback_data="hs_status_only"),
+            ]
+        ]
+
+        await update.message.reply_text(
+            update_text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+    else:
+        await update.message.reply_text(
+            f"{clean_reply}\n\n"
+            f"Контакт {tg_username} не найден в HubSpot.\n"
+            f"Проверь: /find {tg_username}\nИли: /debug",
+        )
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -604,9 +755,10 @@ def main():
     app.add_handler(CommandHandler("setmodel", set_model))
     app.add_handler(CommandHandler("find", find_contact))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info(f"Bot started with HubSpot integration. Model: {MODEL}")
+    logger.info(f"Bot started with HubSpot + file support. Model: {MODEL}")
     logger.info(f"HubSpot key: {HUBSPOT_API_KEY[:8]}...{HUBSPOT_API_KEY[-4:] if HUBSPOT_API_KEY else 'NOT SET'}")
     app.run_polling()
 
