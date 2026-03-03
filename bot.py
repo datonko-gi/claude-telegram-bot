@@ -336,7 +336,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Check if this is a forwarded message
-    is_forwarded = update.message.forward_origin is not None or update.message.forward_date is not None
+    is_forwarded = update.message.forward_origin is not None
     
     # Build message with forwarding context
     if is_forwarded:
