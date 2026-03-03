@@ -4,8 +4,7 @@ import json
 import logging
 import time
 import tempfile
-import csv
-import io
+import base64
 from collections import defaultdict
 from anthropic import Anthropic
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -67,8 +66,8 @@ SYSTEM_PROMPT = """You are a personal AI assistant for Daniel (Danil) Tonkopiy.
 - Responds in the same language Daniel writes in.
 - Keep messages concise for Telegram.
 
-== FILE HANDLING ==
-When Daniel sends you files (xlsx, csv, txt), the system will extract the content and include it in the message. You CAN see file contents — acknowledge them and work with the data.
+== FILE AND IMAGE HANDLING ==
+When Daniel sends files (xlsx, csv, txt) or images/screenshots, the system extracts content and includes it in the message. You CAN see file contents and images — acknowledge them and work with the data.
 
 == HUBSPOT INTEGRATION ==
 You have access to HubSpot CRM. When Daniel shares or forwards a conversation with a lead, or mentions updating a contact:
@@ -113,7 +112,6 @@ def esc(text):
 # === FILE PARSING ===
 
 def parse_xlsx(file_path):
-    """Parse xlsx file and return text representation."""
     try:
         import openpyxl
         wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
@@ -124,12 +122,11 @@ def parse_xlsx(file_path):
             if not rows:
                 continue
             result.append(f"=== Sheet: {sheet_name} ===")
-            for row in rows[:500]:  # Limit to 500 rows
+            for row in rows[:500]:
                 cells = [str(c) if c is not None else "" for c in row]
                 result.append(" | ".join(cells))
         wb.close()
         text = "\n".join(result)
-        # Truncate if too long
         if len(text) > 30000:
             text = text[:30000] + "\n... (truncated)"
         return text
@@ -139,35 +136,28 @@ def parse_xlsx(file_path):
 
 
 def parse_csv(file_path):
-    """Parse csv file and return text representation."""
     try:
         with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-            text = f.read(50000)  # Limit size
-        return text
+            return f.read(50000)
     except Exception as e:
-        logger.error(f"Failed to parse csv: {e}")
         return f"[Error reading csv: {e}]"
 
 
 def parse_text(file_path):
-    """Parse text file and return content."""
     try:
         with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-            text = f.read(50000)
-        return text
+            return f.read(50000)
     except Exception as e:
-        logger.error(f"Failed to parse text: {e}")
         return f"[Error reading file: {e}]"
 
 
 def parse_file(file_path, file_name):
-    """Parse file based on extension."""
     name_lower = file_name.lower()
     if name_lower.endswith(".xlsx") or name_lower.endswith(".xls"):
         return parse_xlsx(file_path)
     elif name_lower.endswith(".csv"):
         return parse_csv(file_path)
-    elif name_lower.endswith(".txt") or name_lower.endswith(".md") or name_lower.endswith(".json"):
+    elif name_lower.endswith((".txt", ".md", ".json", ".py", ".js", ".html")):
         return parse_text(file_path)
     else:
         return f"[Unsupported file type: {file_name}. Supported: xlsx, csv, txt, md, json]"
@@ -198,107 +188,62 @@ def hubspot_request(method, endpoint, data=None):
 
 
 def search_contact_by_telegram(tg_username):
-    """Search HubSpot contact by Telegram username. Tries multiple methods."""
     tg_username_clean = tg_username.lower().strip().lstrip("@")
-    logger.info(f"Searching for contact with telegram: {tg_username_clean}")
+    logger.info(f"Searching for contact: {tg_username_clean}")
 
-    # Method 1: CONTAINS_TOKEN on website field
+    # Method 1: CONTAINS_TOKEN
     data = {
-        "filterGroups": [{
-            "filters": [{
-                "propertyName": "website",
-                "operator": "CONTAINS_TOKEN",
-                "value": tg_username_clean,
-            }]
-        }],
-        "properties": [
-            "firstname", "lastname", "email", "phone",
-            "lifecyclestage", "hs_lead_status", "website",
-        ],
+        "filterGroups": [{"filters": [{"propertyName": "website", "operator": "CONTAINS_TOKEN", "value": tg_username_clean}]}],
+        "properties": ["firstname", "lastname", "email", "phone", "lifecyclestage", "hs_lead_status", "website"],
         "limit": 5,
     }
     result = hubspot_request("POST", "/crm/v3/objects/contacts/search", data)
     if result and "results" in result and result["results"]:
-        logger.info(f"Found {len(result['results'])} contacts via CONTAINS_TOKEN")
         return result["results"]
 
-    # Method 2: EQ with full URL variations
-    for url_pattern in [
-        f"https://t.me/{tg_username_clean}",
-        f"http://t.me/{tg_username_clean}",
-        f"t.me/{tg_username_clean}",
-    ]:
+    # Method 2: EQ with URL variations
+    for url_pattern in [f"https://t.me/{tg_username_clean}", f"http://t.me/{tg_username_clean}", f"t.me/{tg_username_clean}"]:
         data = {
-            "filterGroups": [{
-                "filters": [{
-                    "propertyName": "website",
-                    "operator": "EQ",
-                    "value": url_pattern,
-                }]
-            }],
-            "properties": [
-                "firstname", "lastname", "email", "phone",
-                "lifecyclestage", "hs_lead_status", "website",
-            ],
+            "filterGroups": [{"filters": [{"propertyName": "website", "operator": "EQ", "value": url_pattern}]}],
+            "properties": ["firstname", "lastname", "email", "phone", "lifecyclestage", "hs_lead_status", "website"],
             "limit": 5,
         }
         result = hubspot_request("POST", "/crm/v3/objects/contacts/search", data)
         if result and "results" in result and result["results"]:
-            logger.info(f"Found {len(result['results'])} contacts via EQ '{url_pattern}'")
             return result["results"]
 
-    # Method 3: Fulltext search
+    # Method 3: Fulltext
     data = {
         "query": tg_username_clean,
-        "properties": [
-            "firstname", "lastname", "email", "phone",
-            "lifecyclestage", "hs_lead_status", "website",
-        ],
+        "properties": ["firstname", "lastname", "email", "phone", "lifecyclestage", "hs_lead_status", "website"],
         "limit": 5,
     }
     result = hubspot_request("POST", "/crm/v3/objects/contacts/search", data)
     if result and "results" in result and result["results"]:
-        logger.info(f"Found {len(result['results'])} contacts via fulltext")
         return result["results"]
 
-    # Method 4: Name search if username has underscores
+    # Method 4: Name search
     if "_" in tg_username_clean:
-        name_query = tg_username_clean.replace("_", " ")
         data = {
-            "query": name_query,
-            "properties": [
-                "firstname", "lastname", "email", "phone",
-                "lifecyclestage", "hs_lead_status", "website",
-            ],
+            "query": tg_username_clean.replace("_", " "),
+            "properties": ["firstname", "lastname", "email", "phone", "lifecyclestage", "hs_lead_status", "website"],
             "limit": 5,
         }
         result = hubspot_request("POST", "/crm/v3/objects/contacts/search", data)
         if result and "results" in result and result["results"]:
-            logger.info(f"Found {len(result['results'])} contacts via name search")
             return result["results"]
 
-    logger.warning(f"No contacts found for '{tg_username_clean}'")
     return []
 
 
 def update_contact(contact_id, properties):
-    data = {"properties": properties}
-    return hubspot_request("PATCH", f"/crm/v3/objects/contacts/{contact_id}", data)
+    return hubspot_request("PATCH", f"/crm/v3/objects/contacts/{contact_id}", {"properties": properties})
 
 
 def add_note_to_contact(contact_id, note_text):
     data = {
-        "properties": {
-            "hs_note_body": note_text,
-            "hs_timestamp": str(int(time.time() * 1000)),
-        },
-        "associations": [{
-            "to": {"id": contact_id},
-            "types": [{
-                "associationCategory": "HUBSPOT_DEFINED",
-                "associationTypeId": 202,
-            }]
-        }]
+        "properties": {"hs_note_body": note_text, "hs_timestamp": str(int(time.time() * 1000))},
+        "associations": [{"to": {"id": contact_id}, "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 202}]}]
     }
     return hubspot_request("POST", "/crm/v3/objects/notes", data)
 
@@ -309,7 +254,7 @@ def extract_hubspot_update(text):
         try:
             return json.loads(match.group(1))
         except json.JSONDecodeError:
-            logger.error(f"Failed to parse hubspot_update JSON: {match.group(1)}")
+            logger.error(f"Failed to parse hubspot_update JSON")
     return None
 
 
@@ -345,10 +290,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/model — текущая модель\n"
         "/setmodel — сменить модель\n"
         "/find username — найти контакт\n"
-        "/debug — проверить подключение к HubSpot\n\n"
+        "/debug — проверить HubSpot\n\n"
         "Можно:\n"
         "- Переслать переписку с клиентом\n"
         "- Отправить файл (xlsx, csv, txt)\n"
+        "- Отправить скриншот или фото\n"
         "- Задать любой вопрос"
     )
 
@@ -365,35 +311,16 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def debug_hubspot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.username):
         return
-
     await update.message.reply_text("Тестирую подключение к HubSpot...")
-
     if not HUBSPOT_API_KEY:
         await update.message.reply_text("HUBSPOT_API_KEY не установлен!")
         return
-
     key_preview = HUBSPOT_API_KEY[:8] + "..." + HUBSPOT_API_KEY[-4:]
-
-    data = {
-        "query": "a",
-        "properties": ["firstname", "lastname", "email"],
-        "limit": 1,
-    }
-    result = hubspot_request("POST", "/crm/v3/objects/contacts/search", data)
-
+    result = hubspot_request("POST", "/crm/v3/objects/contacts/search", {"query": "a", "properties": ["firstname"], "limit": 1})
     if "error" in result:
-        await update.message.reply_text(
-            f"HubSpot ОШИБКА!\n\n"
-            f"Ключ: {key_preview}\n"
-            f"Ошибка: {result.get('error')} — {result.get('message', '')[:200]}"
-        )
+        await update.message.reply_text(f"HubSpot ОШИБКА!\nКлюч: {key_preview}\nОшибка: {result.get('error')} — {result.get('message', '')[:200]}")
     else:
-        total = result.get("total", "?")
-        await update.message.reply_text(
-            f"HubSpot подключен!\n\n"
-            f"Ключ: {key_preview}\n"
-            f"Контактов найдено: {total}"
-        )
+        await update.message.reply_text(f"HubSpot подключен!\nКлюч: {key_preview}\nКонтактов: {result.get('total', '?')}")
 
 
 async def model_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -411,10 +338,7 @@ async def set_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Модель изменена: {MODEL}")
     else:
         await update.message.reply_text(
-            "Укажи модель:\n"
-            "/setmodel claude-sonnet-4-20250514\n"
-            "/setmodel claude-opus-4-20250514\n"
-            "/setmodel claude-haiku-4-20250506"
+            "Укажи модель:\n/setmodel claude-sonnet-4-20250514\n/setmodel claude-opus-4-20250514\n/setmodel claude-haiku-4-20250506"
         )
 
 
@@ -424,39 +348,103 @@ async def find_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Укажи username: /find username")
         return
-
     username = context.args[0].lstrip("@")
     msg = await update.message.reply_text(f"Ищу {username} в HubSpot...")
-
     contacts = search_contact_by_telegram(username)
     if not contacts:
-        await msg.edit_text(
-            f"Контакт {username} не найден.\n"
-            f"Проверь подключение: /debug"
-        )
+        await msg.edit_text(f"Контакт {username} не найден.\nПроверь подключение: /debug")
         return
-
     for c in contacts:
         props = c.get("properties", {})
         name = f"{props.get('firstname', '')} {props.get('lastname', '')}".strip() or "—"
         stage = LIFECYCLE_STAGES.get(props.get("lifecyclestage", ""), props.get("lifecyclestage", "—"))
         status = LEAD_STATUSES.get(props.get("hs_lead_status", ""), props.get("hs_lead_status", "—"))
-        website = props.get("website", "—")
-        email = props.get("email", "—")
-        phone = props.get("phone", "—")
         cid = c["id"]
         link = f"https://app.hubspot.com/contacts/47345195/record/0-1/{cid}"
-
         text = (
             f"<b>{esc(name)}</b>\n"
-            f"Email: {esc(email)}\n"
-            f"Phone: {esc(phone)}\n"
-            f"Web: {esc(website)}\n"
+            f"Email: {esc(props.get('email', '—'))}\n"
+            f"Phone: {esc(props.get('phone', '—'))}\n"
+            f"Web: {esc(props.get('website', '—'))}\n"
             f"Stage: {esc(stage)}\n"
             f"Status: {esc(status)}\n"
             f'<a href="{link}">Открыть в HubSpot</a>'
         )
         await update.message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle photos and screenshots - download, encode to base64, send to Claude Vision."""
+    if not is_allowed(update.effective_user.username):
+        return
+
+    chat_id = update.effective_chat.id
+    caption = update.message.caption or "Что на этом изображении?"
+
+    # Get the largest photo
+    photo = update.message.photo[-1]
+
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+
+    try:
+        tg_file = await photo.get_file()
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            tmp_path = tmp.name
+            await tg_file.download_to_drive(tmp_path)
+
+        logger.info(f"Downloaded photo: {photo.file_id} ({photo.width}x{photo.height})")
+
+        # Read and encode to base64
+        with open(tmp_path, "rb") as f:
+            image_data = base64.standard_b64encode(f.read()).decode("utf-8")
+
+        os.unlink(tmp_path)
+
+        # Determine media type
+        media_type = "image/jpeg"
+
+        # Build multimodal message
+        user_content = [
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": image_data,
+                }
+            },
+            {
+                "type": "text",
+                "text": caption,
+            }
+        ]
+
+        conversations[chat_id].append({"role": "user", "content": user_content})
+
+        if len(conversations[chat_id]) > MAX_HISTORY:
+            conversations[chat_id] = conversations[chat_id][-MAX_HISTORY:]
+
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=4096,
+            system=SYSTEM_PROMPT,
+            messages=conversations[chat_id],
+        )
+        reply = response.content[0].text
+        conversations[chat_id].append({"role": "assistant", "content": reply})
+
+        hs_update = extract_hubspot_update(reply)
+        tg_username = extract_hubspot_contact(reply)
+        clean_reply = clean_response(reply)
+
+        if hs_update and tg_username:
+            await _send_hubspot_update(update, chat_id, hs_update, tg_username, clean_reply)
+        else:
+            await _send_reply(update, clean_reply)
+
+    except Exception as e:
+        logger.error(f"Error handling photo: {e}")
+        await update.message.reply_text(f"Ошибка при обработке изображения: {e}")
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -473,8 +461,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     file_name = doc.file_name or "unknown"
     file_size = doc.file_size or 0
+    mime_type = doc.mime_type or ""
 
-    # Limit: 10MB
     if file_size > 10 * 1024 * 1024:
         await update.message.reply_text("Файл слишком большой (макс 10MB).")
         return
@@ -482,31 +470,48 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
     try:
-        # Download file
         tg_file = await doc.get_file()
         with tempfile.NamedTemporaryFile(suffix=f"_{file_name}", delete=False) as tmp:
             tmp_path = tmp.name
             await tg_file.download_to_drive(tmp_path)
 
-        logger.info(f"Downloaded file: {file_name} ({file_size} bytes) to {tmp_path}")
+        logger.info(f"Downloaded file: {file_name} ({file_size} bytes)")
 
-        # Parse file
-        file_content = parse_file(tmp_path, file_name)
+        # Check if it's an image sent as document
+        is_image = mime_type.startswith("image/") or file_name.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))
 
-        # Clean up
-        os.unlink(tmp_path)
+        if is_image:
+            with open(tmp_path, "rb") as f:
+                image_data = base64.standard_b64encode(f.read()).decode("utf-8")
+            os.unlink(tmp_path)
 
-        # Build message for Claude
-        msg_text = f"[FILE: {file_name}]\n{file_content}"
-        if caption:
-            msg_text += f"\n\n[User message]: {caption}"
+            # Detect media type
+            if file_name.lower().endswith(".png"):
+                media_type = "image/png"
+            elif file_name.lower().endswith(".gif"):
+                media_type = "image/gif"
+            elif file_name.lower().endswith(".webp"):
+                media_type = "image/webp"
+            else:
+                media_type = "image/jpeg"
 
-        conversations[chat_id].append({"role": "user", "content": msg_text})
+            user_content = [
+                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_data}},
+                {"type": "text", "text": caption or f"Файл: {file_name}. Что на этом изображении?"}
+            ]
+        else:
+            file_content = parse_file(tmp_path, file_name)
+            os.unlink(tmp_path)
+            msg_text = f"[FILE: {file_name}]\n{file_content}"
+            if caption:
+                msg_text += f"\n\n[User message]: {caption}"
+            user_content = msg_text
+
+        conversations[chat_id].append({"role": "user", "content": user_content})
 
         if len(conversations[chat_id]) > MAX_HISTORY:
             conversations[chat_id] = conversations[chat_id][-MAX_HISTORY:]
 
-        # Send to Claude
         response = client.messages.create(
             model=MODEL,
             max_tokens=4096,
@@ -539,7 +544,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_text:
         return
 
-    # Detect forwarded messages
     fwd_username = None
     try:
         if update.message.forward_origin is not None:
@@ -592,7 +596,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _send_reply(update, text):
-    """Send text reply, splitting if needed."""
     if len(text) <= 4096:
         await update.message.reply_text(text)
     else:
@@ -601,15 +604,12 @@ async def _send_reply(update, text):
 
 
 async def _send_hubspot_update(update, chat_id, hs_update, tg_username, clean_reply):
-    """Search contact and show update buttons."""
     contacts = search_contact_by_telegram(tg_username)
-
     if contacts:
         contact = contacts[0]
         props = contact.get("properties", {})
         name = f"{props.get('firstname', '')} {props.get('lastname', '')}".strip() or tg_username
         cid = contact["id"]
-
         current_stage = LIFECYCLE_STAGES.get(props.get("lifecyclestage", ""), "—")
         current_status = LEAD_STATUSES.get(props.get("hs_lead_status", ""), "—")
         new_stage = LIFECYCLE_STAGES.get(hs_update.get("suggested_lifecycle", ""), "—")
@@ -634,36 +634,22 @@ async def _send_hubspot_update(update, chat_id, hs_update, tg_username, clean_re
         }
 
         keyboard = [
-            [
-                InlineKeyboardButton("✅ Обновить всё", callback_data="hs_confirm"),
-                InlineKeyboardButton("❌ Отмена", callback_data="hs_cancel"),
-            ],
-            [
-                InlineKeyboardButton("📝 Только заметку", callback_data="hs_note_only"),
-                InlineKeyboardButton("📊 Только статус", callback_data="hs_status_only"),
-            ]
+            [InlineKeyboardButton("✅ Обновить всё", callback_data="hs_confirm"), InlineKeyboardButton("❌ Отмена", callback_data="hs_cancel")],
+            [InlineKeyboardButton("📝 Только заметку", callback_data="hs_note_only"), InlineKeyboardButton("📊 Только статус", callback_data="hs_status_only")]
         ]
 
-        await update.message.reply_text(
-            update_text,
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
+        await update.message.reply_text(update_text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
     else:
         await update.message.reply_text(
-            f"{clean_reply}\n\n"
-            f"Контакт {tg_username} не найден в HubSpot.\n"
-            f"Проверь: /find {tg_username}\nИли: /debug",
+            f"{clean_reply}\n\nКонтакт {tg_username} не найден в HubSpot.\nПроверь: /find {tg_username}"
         )
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     chat_id = query.message.chat_id
     pending = pending_updates.get(chat_id)
-
     if not pending:
         await query.edit_message_text("Нет активного обновления.")
         return
@@ -678,24 +664,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             props["lifecyclestage"] = pending["lifecycle"]
         if pending.get("lead_status"):
             props["hs_lead_status"] = pending["lead_status"]
-
         result = update_contact(cid, props) if props else {"ok": True}
-        note_result = {"ok": True}
-        if pending.get("note"):
-            note_result = add_note_to_contact(cid, pending["note"])
-
+        note_result = add_note_to_contact(cid, pending["note"]) if pending.get("note") else {"ok": True}
         if "error" not in result and "error" not in note_result:
             stage_label = LIFECYCLE_STAGES.get(pending.get("lifecycle", ""), "—")
             status_label = LEAD_STATUSES.get(pending.get("lead_status", ""), "—")
             await query.edit_message_text(
-                f"✅ <b>{esc(name)}</b> обновлён!\n\n"
-                f"Stage → {esc(stage_label)}\n"
-                f"Status → {esc(status_label)}\n"
-                f"Заметка добавлена\n\n"
-                f'<a href="{link}">Открыть в HubSpot</a>',
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
+                f"✅ <b>{esc(name)}</b> обновлён!\n\nStage → {esc(stage_label)}\nStatus → {esc(status_label)}\nЗаметка добавлена\n\n"
+                f'<a href="{link}">Открыть в HubSpot</a>', parse_mode="HTML", disable_web_page_preview=True)
         else:
             error = result.get("message", "") or note_result.get("message", "")
             await query.edit_message_text(f"Ошибка: {error[:500]}")
@@ -706,10 +682,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if "error" not in result:
                 await query.edit_message_text(
                     f"📝 Заметка добавлена для <b>{esc(name)}</b>\n\n"
-                    f'<a href="{link}">Открыть в HubSpot</a>',
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                )
+                    f'<a href="{link}">Открыть в HubSpot</a>', parse_mode="HTML", disable_web_page_preview=True)
             else:
                 await query.edit_message_text(f"Ошибка: {result.get('message', '')[:500]}")
         else:
@@ -721,20 +694,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             props["lifecyclestage"] = pending["lifecycle"]
         if pending.get("lead_status"):
             props["hs_lead_status"] = pending["lead_status"]
-
         if props:
             result = update_contact(cid, props)
             if "error" not in result:
                 stage_label = LIFECYCLE_STAGES.get(pending.get("lifecycle", ""), "—")
                 status_label = LEAD_STATUSES.get(pending.get("lead_status", ""), "—")
                 await query.edit_message_text(
-                    f"📊 Статус обновлён: <b>{esc(name)}</b>\n\n"
-                    f"Stage → {esc(stage_label)}\n"
-                    f"Status → {esc(status_label)}\n\n"
-                    f'<a href="{link}">Открыть в HubSpot</a>',
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                )
+                    f"📊 Статус обновлён: <b>{esc(name)}</b>\n\nStage → {esc(stage_label)}\nStatus → {esc(status_label)}\n\n"
+                    f'<a href="{link}">Открыть в HubSpot</a>', parse_mode="HTML", disable_web_page_preview=True)
             else:
                 await query.edit_message_text(f"Ошибка: {result.get('message', '')[:500]}")
         else:
@@ -755,11 +722,11 @@ def main():
     app.add_handler(CommandHandler("setmodel", set_model))
     app.add_handler(CommandHandler("find", find_contact))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info(f"Bot started with HubSpot + file support. Model: {MODEL}")
-    logger.info(f"HubSpot key: {HUBSPOT_API_KEY[:8]}...{HUBSPOT_API_KEY[-4:] if HUBSPOT_API_KEY else 'NOT SET'}")
+    logger.info(f"Bot started with HubSpot + files + vision. Model: {MODEL}")
     app.run_polling()
 
 
