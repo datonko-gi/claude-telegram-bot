@@ -64,10 +64,6 @@ SYSTEM_PROMPT = """You are a personal AI assistant for Daniel (Danil) Tonkopiy.
 == COMMUNICATION STYLE ==
 - Direct, no filler words. Responds in the same language Daniel writes in.
 - Keep messages concise for Telegram.
-- NEVER suggest the user to visit websites, open apps, or do anything manually. You are here to automate tasks.
-- If you cannot do something directly, explain HOW to make you capable of it (what code change or integration is needed), not what the user should do themselves.
-- Never end responses with "you can check...", "I recommend visiting...", "you can use..." type phrases and such approach
-- If asked to fetch data from a site and it fails, try alternative methods (different URL, API endpoint, search) before giving up.
 
 == CAPABILITIES ==
 Text, forwarded messages, files (xlsx, csv, txt), photos/screenshots, calendar, email, Google Drive.
@@ -368,10 +364,9 @@ def parse_file(file_path, file_name):
 
 
 def fetch_url_text(url):
-    """Fetch URL content. Supports Reddit RSS."""
+    """Fetch URL content. Supports Reddit RSS and general pages."""
     try:
         if "reddit.com" in url:
-            # Convert any reddit URL to RSS
             if re.search(r'reddit\.com/?$', url):
                 url = "https://www.reddit.com/r/popular/.rss?limit=25"
             elif "/r/" in url:
@@ -382,7 +377,6 @@ def fetch_url_text(url):
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=10) as resp:
                 content = resp.read().decode("utf-8", errors="replace")
-                # Parse RSS XML
                 titles = re.findall(r'<title><!\[CDATA\[(.*?)\]\]></title>', content)
                 links = re.findall(r'<link>(https://www\.reddit\.com/r/\S+?)</link>', content)
                 titles = [t for t in titles if t != "reddit: the front page of the internet"][:25]
@@ -955,11 +949,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info(f"Bot started. Model: {MODEL} | Google: {'YES' if GOOGLE_REFRESH_TOKEN else 'NO'} | HubSpot: {'YES' if HUBSPOT_API_KEY else 'NO'}")
-
-    async def post_init(application):
-        scheduler.start()
-
-    app.post_init = post_init
+    scheduler.start()
     app.run_polling()
 
 if __name__ == "__main__":
