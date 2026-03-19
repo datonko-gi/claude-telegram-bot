@@ -358,6 +358,33 @@ def parse_file(file_path, file_name):
         except Exception as e: return f"[Error: {e}]"
     return f"[Unsupported: {file_name}]"
 
+def fetch_url_text(url):
+    """Fetch URL content. Supports Reddit JSON API."""
+    try:
+        # Reddit: convert to JSON API
+        if "reddit.com" in url:
+            url = re.sub(r'reddit\.com(/r/[^?#]+)', r'reddit.com\1.json', url)
+            if not url.endswith(".json"):
+                url = url.rstrip("/") + ".json"
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; bot/1.0)"}
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            content = resp.read().decode("utf-8", errors="replace")
+            # If JSON, extract readable text
+            try:
+                data = json.loads(content)
+                if isinstance(data, list) and "data" in data[0]:
+                    posts = data[0]["data"]["children"]
+                    lines = []
+                    for p in posts[:20]:
+                        d = p["data"]
+                        lines.append(f"• {d.get('title','')} ({d.get('score',0)} upvotes) {d.get('url','')}")
+                    return "\n".join(lines)
+            except:
+                pass
+            return content[:8000]
+    except Exception as e:
+        return f"[Ошибка загрузки: {e}]"
 
 # === HUBSPOT ===
 
@@ -656,6 +683,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             df, _ = drive_list_recent(10)
             if df: extra += "\n\n" + format_drive_for_claude(df)
 
+    url_match = re.search(r'https?://\S+', user_text)
+    if url_match:
+        fetched = fetch_url_text(url_match.group(0))
+        extra += f"\n\n[URL CONTENT]\n{fetched}"
+        
     await _process_message(update, chat_id, user_text + extra, fwd_username=fwd_username)
 
 
