@@ -64,6 +64,7 @@ SYSTEM_PROMPT = """You are a personal AI assistant for Daniel (Danil) Tonkopiy.
 == COMMUNICATION STYLE ==
 - Direct, no filler words. Responds in the same language Daniel writes in.
 - Keep messages concise for Telegram.
+- responce to the question you've been asked. for xample if you've been asked about the news from the website - answer with the news from the website and don't describe the website itself
 - NEVER suggest the user to visit websites, open apps, or do anything manually. You are here to automate tasks.
 - If you cannot do something directly, explain HOW to make you capable of it (what code change or integration is needed), not what the user should do themselves.
 - Never end responses with "you can check...", "I recommend visiting...", "you can use..." type phrases.
@@ -696,10 +697,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             df, _ = drive_list_recent(10)
             if df: extra += "\n\n" + format_drive_for_claude(df)
 
-    url_match = re.search(r'https?://\S+', user_text)
+url_match = re.search(r'https?://\S+', user_text)
     if url_match:
         fetched = fetch_url_text(url_match.group(0))
         extra += f"\n\n[URL CONTENT]\n{fetched}"
+    elif any(kw in tl for kw in ["реддит", "reddit", "r/popular", "r/all"]):
+        reddit_match = re.search(r'r/(\w+)', user_text)
+        if reddit_match:
+            fetched = fetch_url_text(f"https://www.reddit.com/r/{reddit_match.group(1)}/")
+        else:
+            fetched = fetch_url_text("https://www.reddit.com/r/popular/")
+        extra += f"\n\n[REDDIT RSS]\n{fetched}"
 
     schedule_kw = ["каждый день в", "каждое утро", "каждый вечер", "ежедневно в", "every day at", "every morning"]
     cancel_kw = ["отмени задачу", "удали задачу", "список задач", "cancel job", "my jobs"]
