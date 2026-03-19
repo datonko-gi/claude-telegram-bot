@@ -68,7 +68,7 @@ SYSTEM_PROMPT = """You are a personal AI assistant for Daniel (Danil) Tonkopiy.
 - If you cannot do something directly, explain HOW to make you capable of it (what code change or integration is needed), not what the user should do themselves.
 - Never end responses with "you can check...", "I recommend visiting...", "you can use..." type phrases.
 - If asked to fetch data from a site and it fails, try alternative methods (different URL, API endpoint, search) before giving up.
-    
+
 == CAPABILITIES ==
 Text, forwarded messages, files (xlsx, csv, txt), photos/screenshots, calendar, email, Google Drive.
 
@@ -953,12 +953,11 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info(f"Bot started. Model: {MODEL} | Google: {'YES' if GOOGLE_REFRESH_TOKEN else 'NO'} | HubSpot: {'YES' if HUBSPOT_API_KEY else 'NO'}")
-
     async def post_init(application):
         scheduler.start()
 
     app.post_init = post_init
     app.run_polling()
-    
+
 if __name__ == "__main__":
     main()
