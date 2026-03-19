@@ -3,6 +3,7 @@ import re
 import json
 import logging
 import time
+import asyncio
 import tempfile
 import base64
 import email.mime.text
@@ -236,7 +237,6 @@ def send_email(to, subject, body):
 # === GOOGLE DRIVE ===
 
 def drive_search(query, max_results=10):
-    """Search Google Drive files."""
     params = urllib.parse.urlencode({
         "q": f"name contains '{query}' and trashed = false",
         "fields": "files(id,name,mimeType,modifiedTime,webViewLink,size)",
@@ -250,7 +250,6 @@ def drive_search(query, max_results=10):
 
 
 def drive_list_recent(max_results=10):
-    """List recent Drive files."""
     params = urllib.parse.urlencode({
         "q": "trashed = false",
         "fields": "files(id,name,mimeType,modifiedTime,webViewLink,size)",
@@ -264,8 +263,6 @@ def drive_list_recent(max_results=10):
 
 
 def drive_get_content(file_id, mime_type):
-    """Get file content from Drive. Returns text content for supported types."""
-    # Google Docs/Sheets/Slides — export as text
     if "google-apps.document" in mime_type:
         result = google_api("GET", f"https://www.googleapis.com/drive/v3/files/{file_id}/export?mimeType=text/plain")
         if isinstance(result, dict) and "error" in result:
@@ -276,8 +273,6 @@ def drive_get_content(file_id, mime_type):
         if isinstance(result, dict) and "error" in result:
             return None
         return result if isinstance(result, str) else json.dumps(result)[:10000]
-    
-    # For text-based files, download directly
     token = get_google_token()
     if not token: return None
     try:
@@ -297,7 +292,6 @@ def drive_get_content(file_id, mime_type):
 
 
 def format_drive_files(files):
-    """Format Drive files for display."""
     if not files: return "Файлов не найдено."
     lines = []
     type_map = {
@@ -312,13 +306,11 @@ def format_drive_files(files):
         ftype = type_map.get(mt, mt.split("/")[-1][:10] if "/" in mt else "?")
         mod = f.get("modifiedTime", "")[:10]
         name = f.get("name", "?")
-        link = f.get("webViewLink", "")
         lines.append(f"[{ftype}] {name}  ({mod})")
     return "\n".join(lines)
 
 
 def format_drive_for_claude(files, content_map=None):
-    """Format Drive data for Claude context."""
     if not files: return "[DRIVE DATA]\nNo files found."
     lines = ["[DRIVE DATA]"]
     for f in files:
@@ -522,7 +514,6 @@ async def drive_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Google не настроен.")
         return
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-    
     if context.args:
         query = " ".join(context.args)
         files, err = drive_search(query, 10)
@@ -530,14 +521,12 @@ async def drive_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         files, err = drive_list_recent(10)
         label = "Последние файлы"
-    
     if err:
         await update.message.reply_text(f"Ошибка: {err[:200]}")
         return
     if not files:
-        await update.message.reply_text(f"Файлов не найдено.")
+        await update.message.reply_text("Файлов не найдено.")
         return
-    
     text = f"{label}:\n\n{format_drive_files(files)}"
     await update.message.reply_text(text[:4096])
 
@@ -651,14 +640,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 user_text = f"[FORWARDED from {fwd_name}]\n{user_text}"
     except: pass
 
-    # Auto-fetch context
     extra = ""
     tl = user_text.lower()
     if GOOGLE_REFRESH_TOKEN:
         cal_kw = ["календар", "расписан", "встреч", "событ", "schedule", "calendar", "meeting", "что у меня", "свободен", "занят", "план на"]
         mail_kw = ["почт", "письм", "email", "mail", "inbox", "gmail", "непрочитан", "написал"]
         drive_kw = ["файл", "документ", "drive", "диск", "найди файл", "doc", "presentation", "таблиц", "sheet"]
-        
         if any(kw in tl for kw in cal_kw):
             ev, _ = get_calendar_events(3, 15)
             if ev: extra += "\n\n" + format_calendar_for_claude(ev)
@@ -666,63 +653,72 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             em, _ = get_emails("is:unread", 10)
             if em: extra += "\n\n" + format_emails_for_claude(em)
         if any(kw in tl for kw in drive_kw):
-            # Try to extract search query from the message
             df, _ = drive_list_recent(10)
             if df: extra += "\n\n" + format_drive_for_claude(df)
 
-    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
     await _process_message(update, chat_id, user_text + extra, fwd_username=fwd_username)
+
+
+async def _keep_typing(bot, chat_id, stop_event):
+    while not stop_event.is_set():
+        await bot.send_chat_action(chat_id=chat_id, action="typing")
+        await asyncio.sleep(4)
 
 
 async def _process_message(update, chat_id, content, fwd_username=None):
     conversations[chat_id].append({"role": "user", "content": content})
     if len(conversations[chat_id]) > MAX_HISTORY:
         conversations[chat_id] = conversations[chat_id][-MAX_HISTORY:]
-try:
-            response = client.messages.create(
-                model=MODEL,
-                max_tokens=4096,
-                system=SYSTEM_PROMPT,
-                messages=conversations[chat_id],
-                tools=[{
-                    "type": "web_search_20250305",
-                    "name": "web_search"
-                }]
-            )
-            reply = "\n".join(
-                block.text for block in response.content
-                if hasattr(block, "text")
-            )
-            conversations[chat_id].append({"role": "assistant", "content": reply})
-
-            hs_update = extract_tag_json(reply, "hubspot_update")
-            tg_username = extract_tag_text(reply, "hubspot_contact") or fwd_username
-            if tg_username: tg_username = tg_username.lstrip("@")
-            cal_create = extract_tag_json(reply, "calendar_create")
-            email_send = extract_tag_json(reply, "gmail_send")
-            clean = clean_response(reply)
-
-            if hs_update and tg_username:
-                await _send_hubspot_update(update, chat_id, hs_update, tg_username, clean)
-            elif cal_create:
-                pending_updates[chat_id] = {"type": "calendar", "data": cal_create}
-                kb = [[InlineKeyboardButton("✅ Создать", callback_data="cal_confirm"), InlineKeyboardButton("❌ Отмена", callback_data="cal_cancel")]]
-                await update.message.reply_text(
-                    f"{esc(clean)}\n\n——————————\n<b>Создать событие:</b>\n"
-                    f"{esc(cal_create.get('summary',''))}\n{esc(cal_create.get('start',''))} — {esc(cal_create.get('end',''))}",
-                    parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
-            elif email_send:
-                pending_updates[chat_id] = {"type": "email", "data": email_send}
-                kb = [[InlineKeyboardButton("✅ Отправить", callback_data="email_confirm"), InlineKeyboardButton("❌ Отмена", callback_data="email_cancel")]]
-                await update.message.reply_text(
-                    f"{esc(clean)}\n\n——————————\n<b>Письмо:</b>\nTo: {esc(email_send.get('to',''))}\n"
-                    f"Subject: {esc(email_send.get('subject',''))}\n{esc(email_send.get('body','')[:200])}...",
-                    parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
-            else:
-                await _send_reply(update, clean)
-        except Exception as e:
-            logger.error(f"Error: {e}")
-            await update.message.reply_text(f"Ошибка: {e}")
+    try:
+        stop_typing = asyncio.Event()
+        typing_task = asyncio.create_task(
+            _keep_typing(update.get_bot(), chat_id, stop_typing)
+        )
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=4096,
+            system=SYSTEM_PROMPT,
+            messages=conversations[chat_id],
+            tools=[{
+                "type": "web_search_20250305",
+                "name": "web_search"
+            }]
+        )
+        stop_typing.set()
+        await typing_task
+        reply = "\n".join(
+            block.text for block in response.content
+            if hasattr(block, "text")
+        )
+        conversations[chat_id].append({"role": "assistant", "content": reply})
+        hs_update = extract_tag_json(reply, "hubspot_update")
+        tg_username = extract_tag_text(reply, "hubspot_contact") or fwd_username
+        if tg_username: tg_username = tg_username.lstrip("@")
+        cal_create = extract_tag_json(reply, "calendar_create")
+        email_send = extract_tag_json(reply, "gmail_send")
+        clean = clean_response(reply)
+        if hs_update and tg_username:
+            await _send_hubspot_update(update, chat_id, hs_update, tg_username, clean)
+        elif cal_create:
+            pending_updates[chat_id] = {"type": "calendar", "data": cal_create}
+            kb = [[InlineKeyboardButton("✅ Создать", callback_data="cal_confirm"), InlineKeyboardButton("❌ Отмена", callback_data="cal_cancel")]]
+            await update.message.reply_text(
+                f"{esc(clean)}\n\n——————————\n<b>Создать событие:</b>\n"
+                f"{esc(cal_create.get('summary',''))}\n{esc(cal_create.get('start',''))} — {esc(cal_create.get('end',''))}",
+                parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+        elif email_send:
+            pending_updates[chat_id] = {"type": "email", "data": email_send}
+            kb = [[InlineKeyboardButton("✅ Отправить", callback_data="email_confirm"), InlineKeyboardButton("❌ Отмена", callback_data="email_cancel")]]
+            await update.message.reply_text(
+                f"{esc(clean)}\n\n——————————\n<b>Письмо:</b>\nTo: {esc(email_send.get('to',''))}\n"
+                f"Subject: {esc(email_send.get('subject',''))}\n{esc(email_send.get('body','')[:200])}...",
+                parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+        else:
+            await _send_reply(update, clean)
+    except Exception as e:
+        stop_typing.set()
+        logger.error(f"Error: {e}")
+        await update.message.reply_text(f"Ошибка: {e}")
 
 
 async def _send_reply(update, text):
@@ -738,6 +734,7 @@ async def _send_hubspot_update(update, chat_id, hs_update, tg_username, clean):
         p = c.get("properties", {})
         name = f"{p.get('firstname', '')} {p.get('lastname', '')}".strip() or tg_username
         cid = c["id"]
+        link = f"https://app.hubspot.com/contacts/47345195/record/0-1/{cid}"
         cs = LIFECYCLE_STAGES.get(p.get("lifecyclestage", ""), "—")
         cst = LEAD_STATUSES.get(p.get("hs_lead_status", ""), "—")
         ns = LIFECYCLE_STAGES.get(hs_update.get("suggested_lifecycle", ""), "—")
@@ -795,7 +792,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await q.edit_message_text(f"📊 <b>{esc(name)}</b> обновлён\n<a href=\"{link}\">HubSpot</a>", parse_mode="HTML", disable_web_page_preview=True)
                 else: await q.edit_message_text(f"Ошибка: {r.get('message','')[:500]}")
         elif q.data == "hs_cancel":
-            await q.edit_message_text(f"Отменено.")
+            await q.edit_message_text("Отменено.")
     elif t == "calendar":
         if q.data == "cal_confirm":
             d = pending["data"]
@@ -817,7 +814,6 @@ def main():
     for cmd, fn in [("start", start), ("reset", reset), ("debug", debug_cmd), ("cal", calendar_cmd),
                     ("mail", mail_cmd), ("drive", drive_cmd), ("model", model_info), ("setmodel", set_model), ("find", find_contact)]:
         app.add_handler(CommandHandler(cmd, fn))
-    # Also handle /cal1 through /cal14
     for i in range(1, 15):
         app.add_handler(CommandHandler(f"cal{i}", calendar_cmd))
     app.add_handler(CallbackQueryHandler(handle_callback))
