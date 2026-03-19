@@ -15,6 +15,8 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 import urllib.request
 import urllib.error
 import urllib.parse
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -33,6 +35,8 @@ GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
 conversations: dict[int, list] = defaultdict(list)
 pending_updates: dict[int, dict] = {}
+scheduled_jobs: dict[int, list] = defaultdict(list)
+scheduler = AsyncIOScheduler()
 _google_token_cache = {"token": "", "expires": 0}
 
 HUBSPOT_BASE = "https://api.hubapi.com"
@@ -688,6 +692,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fetched = fetch_url_text(url_match.group(0))
         extra += f"\n\n[URL CONTENT]\n{fetched}"
 
+    schedule_kw = ["каждый день в", "каждое утро", "каждый вечер", "ежедневно в", "every day at", "every morning"]
+    cancel_kw = ["отмени задачу", "удали задачу", "список задач", "cancel job", "my jobs"]
+    if any(kw in tl for kw in schedule_kw):
+        reply = await handle_schedule_command(update, chat_id, user_text)
+        await update.message.reply_text(reply, parse_mode="HTML")
+        return
+    if any(kw in tl for kw in cancel_kw):
+        reply = await handle_cancel_schedule(update, chat_id, user_text)
+        await update.message.reply_text(reply, parse_mode="HTML")
+        return
+
     await _process_message(update, chat_id, user_text + extra, fwd_username=fwd_username)
 
 
@@ -851,6 +866,72 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending_updates.pop(chat_id, None)
 
 
+async def handle_schedule_command(update, chat_id, user_text):
+    hour, minute = 9, 0
+    match = re.search(r'в\s+(\d{1,2})(?::(\d{2}))?\s*(утра|вечера|am|pm)?', user_text.lower())
+    if not match:
+        match = re.search(r'at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?', user_text.lower())
+    if match:
+        hour = int(match.group(1))
+        minute = int(match.group(2)) if match.group(2) else 0
+        suffix = match.group(3) or ""
+        if suffix in ("вечера", "pm") and hour < 12:
+            hour += 12
+
+    job_id = f"job_{chat_id}_{hour}_{minute}"
+    task = user_text
+
+    if scheduler.get_job(job_id):
+        scheduler.remove_job(job_id)
+        scheduled_jobs[chat_id] = [j for j in scheduled_jobs[chat_id] if j["id"] != job_id]
+
+    async def scheduled_task():
+        try:
+            response = client.messages.create(
+                model=MODEL,
+                max_tokens=2048,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": task}],
+                tools=[{"type": "web_search_20250305", "name": "web_search"}]
+            )
+            reply = "\n".join(block.text for block in response.content if hasattr(block, "text"))
+            reply = md_to_html(reply)
+            from telegram import Bot
+            bot = Bot(token=TELEGRAM_TOKEN)
+            for i in range(0, len(reply), 4096):
+                await bot.send_message(chat_id=chat_id, text=reply[i:i+4096], parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Scheduled task error: {e}")
+
+    scheduler.add_job(
+        scheduled_task,
+        CronTrigger(hour=hour, minute=minute, timezone="America/Los_Angeles"),
+        id=job_id,
+        replace_existing=True
+    )
+    scheduled_jobs[chat_id].append({"id": job_id, "time": f"{hour:02d}:{minute:02d}", "task": task[:80]})
+    return f"✅ Задача создана: каждый день в <b>{hour:02d}:{minute:02d}</b> PT\nЗадание: {esc(task[:100])}\n\nЧтобы отменить: напиши <b>отмени задачу {hour:02d}:{minute:02d}</b>"
+
+
+async def handle_cancel_schedule(update, chat_id, user_text):
+    match = re.search(r'(\d{1,2}):?(\d{2})?', user_text)
+    if match:
+        hour = int(match.group(1))
+        minute = int(match.group(2)) if match.group(2) else 0
+        job_id = f"job_{chat_id}_{hour}_{minute}"
+        if scheduler.get_job(job_id):
+            scheduler.remove_job(job_id)
+            scheduled_jobs[chat_id] = [j for j in scheduled_jobs[chat_id] if j["id"] != job_id]
+            return f"✅ Задача в {hour:02d}:{minute:02d} отменена."
+    jobs = scheduled_jobs.get(chat_id, [])
+    if not jobs:
+        return "Нет активных задач."
+    lines = ["Активные задачи:"]
+    for j in jobs:
+        lines.append(f"• {j['time']} — {j['task']}")
+    return "\n".join(lines)
+
+
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     for cmd, fn in [("start", start), ("reset", reset), ("debug", debug_cmd), ("cal", calendar_cmd),
@@ -863,6 +944,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info(f"Bot started. Model: {MODEL} | Google: {'YES' if GOOGLE_REFRESH_TOKEN else 'NO'} | HubSpot: {'YES' if HUBSPOT_API_KEY else 'NO'}")
+    scheduler.start()
     app.run_polling()
 
 if __name__ == "__main__":
