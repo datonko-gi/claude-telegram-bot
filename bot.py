@@ -678,39 +678,51 @@ async def _process_message(update, chat_id, content, fwd_username=None):
     conversations[chat_id].append({"role": "user", "content": content})
     if len(conversations[chat_id]) > MAX_HISTORY:
         conversations[chat_id] = conversations[chat_id][-MAX_HISTORY:]
-    try:
-        response = client.messages.create(model=MODEL, max_tokens=4096, system=SYSTEM_PROMPT, messages=conversations[chat_id])
-        reply = response.content[0].text
-        conversations[chat_id].append({"role": "assistant", "content": reply})
+try:
+            response = client.messages.create(
+                model=MODEL,
+                max_tokens=4096,
+                system=SYSTEM_PROMPT,
+                messages=conversations[chat_id],
+                tools=[{
+                    "type": "web_search_20250305",
+                    "name": "web_search"
+                }]
+            )
+            reply = "\n".join(
+                block.text for block in response.content
+                if hasattr(block, "text")
+            )
+            conversations[chat_id].append({"role": "assistant", "content": reply})
 
-        hs_update = extract_tag_json(reply, "hubspot_update")
-        tg_username = extract_tag_text(reply, "hubspot_contact") or fwd_username
-        if tg_username: tg_username = tg_username.lstrip("@")
-        cal_create = extract_tag_json(reply, "calendar_create")
-        email_send = extract_tag_json(reply, "gmail_send")
-        clean = clean_response(reply)
+            hs_update = extract_tag_json(reply, "hubspot_update")
+            tg_username = extract_tag_text(reply, "hubspot_contact") or fwd_username
+            if tg_username: tg_username = tg_username.lstrip("@")
+            cal_create = extract_tag_json(reply, "calendar_create")
+            email_send = extract_tag_json(reply, "gmail_send")
+            clean = clean_response(reply)
 
-        if hs_update and tg_username:
-            await _send_hubspot_update(update, chat_id, hs_update, tg_username, clean)
-        elif cal_create:
-            pending_updates[chat_id] = {"type": "calendar", "data": cal_create}
-            kb = [[InlineKeyboardButton("✅ Создать", callback_data="cal_confirm"), InlineKeyboardButton("❌ Отмена", callback_data="cal_cancel")]]
-            await update.message.reply_text(
-                f"{esc(clean)}\n\n━━━━━━━━━━━━━━━\n<b>Создать событие:</b>\n"
-                f"{esc(cal_create.get('summary',''))}\n{esc(cal_create.get('start',''))} — {esc(cal_create.get('end',''))}",
-                parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
-        elif email_send:
-            pending_updates[chat_id] = {"type": "email", "data": email_send}
-            kb = [[InlineKeyboardButton("✅ Отправить", callback_data="email_confirm"), InlineKeyboardButton("❌ Отмена", callback_data="email_cancel")]]
-            await update.message.reply_text(
-                f"{esc(clean)}\n\n━━━━━━━━━━━━━━━\n<b>Письмо:</b>\nTo: {esc(email_send.get('to',''))}\n"
-                f"Subject: {esc(email_send.get('subject',''))}\n{esc(email_send.get('body','')[:200])}...",
-                parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
-        else:
-            await _send_reply(update, clean)
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        await update.message.reply_text(f"Ошибка: {e}")
+            if hs_update and tg_username:
+                await _send_hubspot_update(update, chat_id, hs_update, tg_username, clean)
+            elif cal_create:
+                pending_updates[chat_id] = {"type": "calendar", "data": cal_create}
+                kb = [[InlineKeyboardButton("✅ Создать", callback_data="cal_confirm"), InlineKeyboardButton("❌ Отмена", callback_data="cal_cancel")]]
+                await update.message.reply_text(
+                    f"{esc(clean)}\n\n——————————\n<b>Создать событие:</b>\n"
+                    f"{esc(cal_create.get('summary',''))}\n{esc(cal_create.get('start',''))} — {esc(cal_create.get('end',''))}",
+                    parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+            elif email_send:
+                pending_updates[chat_id] = {"type": "email", "data": email_send}
+                kb = [[InlineKeyboardButton("✅ Отправить", callback_data="email_confirm"), InlineKeyboardButton("❌ Отмена", callback_data="email_cancel")]]
+                await update.message.reply_text(
+                    f"{esc(clean)}\n\n——————————\n<b>Письмо:</b>\nTo: {esc(email_send.get('to',''))}\n"
+                    f"Subject: {esc(email_send.get('subject',''))}\n{esc(email_send.get('body','')[:200])}...",
+                    parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+            else:
+                await _send_reply(update, clean)
+        except Exception as e:
+            logger.error(f"Error: {e}")
+            await update.message.reply_text(f"Ошибка: {e}")
 
 
 async def _send_reply(update, text):
