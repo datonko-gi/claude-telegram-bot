@@ -64,11 +64,11 @@ SYSTEM_PROMPT = """You are a personal AI assistant for Daniel (Danil) Tonkopiy.
 == COMMUNICATION STYLE ==
 - Direct, no filler words. Responds in the same language Daniel writes in.
 - Keep messages concise for Telegram.
-- responce to the question you've been asked. for xample if you've been asked about the news from the website - answer with the news from the website and don't describe the website itself
 - NEVER suggest the user to visit websites, open apps, or do anything manually. You are here to automate tasks.
 - If you cannot do something directly, explain HOW to make you capable of it (what code change or integration is needed), not what the user should do themselves.
 - Never end responses with "you can check...", "I recommend visiting...", "you can use..." type phrases.
 - If asked to fetch data from a site and it fails, try alternative methods (different URL, API endpoint, search) before giving up.
+- Respond to the question you've been asked. For example if you've been asked about the news from the website — answer with the news from the website and don't describe the website itself.
 
 == CAPABILITIES ==
 Text, forwarded messages, files (xlsx, csv, txt), photos/screenshots, calendar, email, Google Drive.
@@ -697,7 +697,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             df, _ = drive_list_recent(10)
             if df: extra += "\n\n" + format_drive_for_claude(df)
 
-url_match = re.search(r'https?://\S+', user_text)
+    url_match = re.search(r'https?://\S+', user_text)
     if url_match:
         fetched = fetch_url_text(url_match.group(0))
         extra += f"\n\n[URL CONTENT]\n{fetched}"
@@ -733,20 +733,23 @@ async def _process_message(update, chat_id, content, fwd_username=None):
     conversations[chat_id].append({"role": "user", "content": content})
     if len(conversations[chat_id]) > MAX_HISTORY:
         conversations[chat_id] = conversations[chat_id][-MAX_HISTORY:]
+    stop_typing = asyncio.Event()
+    typing_task = asyncio.create_task(
+        _keep_typing(update.get_bot(), chat_id, stop_typing)
+    )
     try:
-        stop_typing = asyncio.Event()
-        typing_task = asyncio.create_task(
-            _keep_typing(update.get_bot(), chat_id, stop_typing)
-        )
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=4096,
-            system=SYSTEM_PROMPT,
-            messages=conversations[chat_id],
-            tools=[{
-                "type": "web_search_20250305",
-                "name": "web_search"
-            }]
+        response = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: client.messages.create(
+                    model=MODEL,
+                    max_tokens=4096,
+                    system=SYSTEM_PROMPT,
+                    messages=conversations[chat_id],
+                    tools=[{"type": "web_search_20250305", "name": "web_search"}]
+                )
+            ),
+            timeout=60
         )
         stop_typing.set()
         await typing_task
@@ -779,10 +782,16 @@ async def _process_message(update, chat_id, content, fwd_username=None):
                 parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
         else:
             await _send_reply(update, clean)
+    except asyncio.TimeoutError:
+        stop_typing.set()
+        await typing_task
+        logger.error("Request timed out after 60s")
+        await update.message.reply_text("⏱ Запрос занял слишком долго (>60 сек). Попробуй ещё раз.")
     except Exception as e:
         stop_typing.set()
+        await typing_task
         logger.error(f"Error: {e}")
-        await update.message.reply_text(f"Ошибка: {e}")
+        await update.message.reply_text(f"❌ Ошибка: {esc(str(e)[:200])}")
 
 
 def md_to_html(text):
