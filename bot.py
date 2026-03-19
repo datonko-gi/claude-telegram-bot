@@ -949,8 +949,12 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info(f"Bot started. Model: {MODEL} | Google: {'YES' if GOOGLE_REFRESH_TOKEN else 'NO'} | HubSpot: {'YES' if HUBSPOT_API_KEY else 'NO'}")
-    scheduler.start()
-    app.run_polling()
 
+    async def post_init(application):
+        scheduler.start()
+
+    app.post_init = post_init
+    app.run_polling()
+    
 if __name__ == "__main__":
     main()
