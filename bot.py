@@ -721,10 +721,20 @@ async def _process_message(update, chat_id, content, fwd_username=None):
         await update.message.reply_text(f"Ошибка: {e}")
 
 
+def md_to_html(text):
+    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+    text = re.sub(r'\*(.+?)\*', r'<i>\1</i>', text)
+    text = re.sub(r'`(.+?)`', r'<code>\1</code>', text)
+    text = re.sub(r'^#{1,3}\s+(.+)$', r'<b>\1</b>', text, flags=re.MULTILINE)
+    text = re.sub(r'^\s*-{3,}\s*$', '——————————', text, flags=re.MULTILINE)
+    return text.strip()
+
+
 async def _send_reply(update, text):
     if not text: text = "(пустой ответ)"
+    text = md_to_html(text)
     for i in range(0, len(text), 4096):
-        await update.message.reply_text(text[i:i+4096])
+        await update.message.reply_text(text[i:i+4096], parse_mode="HTML")
 
 
 async def _send_hubspot_update(update, chat_id, hs_update, tg_username, clean):
