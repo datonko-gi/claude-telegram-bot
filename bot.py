@@ -64,6 +64,10 @@ SYSTEM_PROMPT = """You are a personal AI assistant for Daniel (Danil) Tonkopiy.
 == COMMUNICATION STYLE ==
 - Direct, no filler words. Responds in the same language Daniel writes in.
 - Keep messages concise for Telegram.
+- NEVER suggest the user to visit websites, open apps, or do anything manually. You are here to automate tasks.
+- If you cannot do something directly, explain HOW to make you capable of it (what code change or integration is needed), not what the user should do themselves.
+- Never end responses with "you can check...", "I recommend visiting...", "you can use..." type phrases and such approach
+- If asked to fetch data from a site and it fails, try alternative methods (different URL, API endpoint, search) before giving up.
 
 == CAPABILITIES ==
 Text, forwarded messages, files (xlsx, csv, txt), photos/screenshots, calendar, email, Google Drive.
@@ -367,9 +371,13 @@ def fetch_url_text(url):
     """Fetch URL content. Supports Reddit JSON API."""
     try:
         if "reddit.com" in url:
-            url = re.sub(r'reddit\.com(/r/[^?#]+)', r'reddit.com\1.json', url)
-            if not url.endswith(".json"):
-                url = url.rstrip("/") + ".json"
+            # Root reddit.com → r/popular
+            if re.search(r'reddit\.com/?$', url):
+                url = "https://www.reddit.com/r/popular.json?limit=25"
+            else:
+                url = re.sub(r'reddit\.com(/r/[^?#]+)', r'reddit.com\1.json', url)
+                if ".json" not in url:
+                    url = url.rstrip("/") + ".json"
         headers = {"User-Agent": "Mozilla/5.0 (compatible; bot/1.0)"}
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -378,10 +386,15 @@ def fetch_url_text(url):
                 data = json.loads(content)
                 if isinstance(data, list) and "data" in data[0]:
                     posts = data[0]["data"]["children"]
+                elif isinstance(data, dict) and "data" in data:
+                    posts = data["data"]["children"]
+                else:
+                    posts = []
+                if posts:
                     lines = []
-                    for p in posts[:20]:
+                    for p in posts[:25]:
                         d = p["data"]
-                        lines.append(f"• {d.get('title','')} ({d.get('score',0)} upvotes) {d.get('url','')}")
+                        lines.append(f"• {d.get('title','')} ({d.get('score',0)} upvotes) r/{d.get('subreddit','')} {d.get('url','')}")
                     return "\n".join(lines)
             except:
                 pass
