@@ -368,37 +368,35 @@ def parse_file(file_path, file_name):
 
 
 def fetch_url_text(url):
-    """Fetch URL content. Supports Reddit JSON API."""
+    """Fetch URL content. Supports Reddit RSS."""
     try:
         if "reddit.com" in url:
-            # Root reddit.com → r/popular
+            # Convert any reddit URL to RSS
             if re.search(r'reddit\.com/?$', url):
-                url = "https://www.reddit.com/r/popular.json?limit=25"
-            else:
-                url = re.sub(r'reddit\.com(/r/[^?#]+)', r'reddit.com\1.json', url)
-                if ".json" not in url:
-                    url = url.rstrip("/") + ".json"
+                url = "https://www.reddit.com/r/popular/.rss?limit=25"
+            elif "/r/" in url:
+                base = re.search(r'(reddit\.com/r/[^/?#]+)', url)
+                if base:
+                    url = f"https://www.{base.group(1)}/.rss?limit=25"
+            headers = {"User-Agent": "Mozilla/5.0 (compatible; bot/1.0)"}
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                content = resp.read().decode("utf-8", errors="replace")
+                # Parse RSS XML
+                titles = re.findall(r'<title><!\[CDATA\[(.*?)\]\]></title>', content)
+                links = re.findall(r'<link>(https://www\.reddit\.com/r/\S+?)</link>', content)
+                titles = [t for t in titles if t != "reddit: the front page of the internet"][:25]
+                lines = []
+                for i, title in enumerate(titles):
+                    link = links[i] if i < len(links) else ""
+                    lines.append(f"• {title} {link}")
+                if lines:
+                    return "\n".join(lines)
+                return content[:3000]
         headers = {"User-Agent": "Mozilla/5.0 (compatible; bot/1.0)"}
         req = urllib.request.Request(url, headers=headers)
         with urllib.request.urlopen(req, timeout=10) as resp:
-            content = resp.read().decode("utf-8", errors="replace")
-            try:
-                data = json.loads(content)
-                if isinstance(data, list) and "data" in data[0]:
-                    posts = data[0]["data"]["children"]
-                elif isinstance(data, dict) and "data" in data:
-                    posts = data["data"]["children"]
-                else:
-                    posts = []
-                if posts:
-                    lines = []
-                    for p in posts[:25]:
-                        d = p["data"]
-                        lines.append(f"• {d.get('title','')} ({d.get('score',0)} upvotes) r/{d.get('subreddit','')} {d.get('url','')}")
-                    return "\n".join(lines)
-            except:
-                pass
-            return content[:8000]
+            return resp.read().decode("utf-8", errors="replace")[:8000]
     except Exception as e:
         return f"[Ошибка загрузки: {e}]"
 
