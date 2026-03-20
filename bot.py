@@ -89,6 +89,9 @@ When [CALENDAR DATA] is provided, analyze and answer. To create events:
 == GMAIL ==
 When [GMAIL DATA] is provided, analyze and summarize. To send:
 <gmail_send>{"to":"...","subject":"...","body":"..."}</gmail_send>
+To save as draft (use when email address is unknown or user wants to review first):
+<gmail_draft>{"to":"...","subject":"...","body":"..."}</gmail_draft>
+Daniel must confirm before sending. For drafts, "to" can be empty string if address unknown.
 Daniel must confirm before sending.
 
 == GOOGLE DRIVE ==
@@ -241,6 +244,14 @@ def send_email(to, subject, body):
     msg["subject"] = subject
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
     return google_api("POST", "https://www.googleapis.com/gmail/v1/users/me/messages/send", {"raw": raw})
+
+
+def save_draft(to, subject, body):
+    msg = email.mime.text.MIMEText(body)
+    if to: msg["to"] = to
+    msg["subject"] = subject
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    return google_api("POST", "https://www.googleapis.com/gmail/v1/users/me/drafts", {"message": {"raw": raw}})
 
 
 # === GOOGLE DRIVE ===
@@ -452,7 +463,7 @@ def extract_tag_text(text, tag):
     return match.group(1).strip() if match else None
 
 def clean_response(text):
-    for tag in ["hubspot_update", "hubspot_contact", "calendar_create", "gmail_send"]:
+    for tag in ["hubspot_update", "hubspot_contact", "calendar_create", "gmail_send", "gmail_draft"]:
         text = re.sub(rf"<{tag}>.*?</{tag}>", "", text, flags=re.DOTALL)
     return text.strip()
 
@@ -763,6 +774,7 @@ async def _process_message(update, chat_id, content, fwd_username=None):
         if tg_username: tg_username = tg_username.lstrip("@")
         cal_create = extract_tag_json(reply, "calendar_create")
         email_send = extract_tag_json(reply, "gmail_send")
+        email_draft = extract_tag_json(reply, "gmail_draft")
         clean = clean_response(reply)
         if hs_update and tg_username:
             await _send_hubspot_update(update, chat_id, hs_update, tg_username, clean)
@@ -779,6 +791,13 @@ async def _process_message(update, chat_id, content, fwd_username=None):
             await update.message.reply_text(
                 f"{esc(clean)}\n\n——————————\n<b>Письмо:</b>\nTo: {esc(email_send.get('to',''))}\n"
                 f"Subject: {esc(email_send.get('subject',''))}\n{esc(email_send.get('body','')[:200])}...",
+                parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+        elif email_draft:
+            pending_updates[chat_id] = {"type": "draft", "data": email_draft}
+            kb = [[InlineKeyboardButton("💾 Сохранить черновик", callback_data="draft_confirm"), InlineKeyboardButton("❌ Отмена", callback_data="draft_cancel")]]
+            await update.message.reply_text(
+                f"{esc(clean)}\n\n——————————\n<b>Черновик:</b>\nTo: {esc(email_draft.get('to','(не указан)'))}\n"
+                f"Subject: {esc(email_draft.get('subject',''))}\n{esc(email_draft.get('body','')[:200])}...",
                 parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
         else:
             await _send_reply(update, clean)
@@ -887,6 +906,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             d = pending["data"]
             r = send_email(d["to"], d["subject"], d["body"])
             await q.edit_message_text(f"✅ Письмо отправлено: {d['to']}" if "error" not in r else f"Ошибка: {r.get('message','')[:300]}")
+        else: await q.edit_message_text("Отменено.")
+    elif t == "draft":
+        if q.data == "draft_confirm":
+            d = pending["data"]
+            r = save_draft(d.get("to", ""), d["subject"], d["body"])
+            await q.edit_message_text("💾 Черновик сохранён в Gmail." if "error" not in r else f"Ошибка: {r.get('message','')[:300]}")
         else: await q.edit_message_text("Отменено.")
 
     pending_updates.pop(chat_id, None)
