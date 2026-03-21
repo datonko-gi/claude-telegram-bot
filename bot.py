@@ -369,9 +369,42 @@ def parse_xlsx(file_path):
         return f"[Error: {e}]"
 
 
+def parse_pdf(file_path):
+    try:
+        import pdfplumber
+        result = []
+        with pdfplumber.open(file_path) as pdf:
+            for i, page in enumerate(pdf.pages[:50]):
+                text = page.extract_text()
+                if text:
+                    result.append(f"--- Page {i+1} ---\n{text}")
+        return "\n".join(result)[:30000] if result else "[PDF: no text found]"
+    except Exception as e:
+        return f"[PDF Error: {e}]"
+
+
+def parse_docx(file_path):
+    try:
+        from docx import Document
+        doc = Document(file_path)
+        result = []
+        for para in doc.paragraphs:
+            if para.text.strip():
+                result.append(para.text)
+        for table in doc.tables:
+            for row in table.rows:
+                cells = [cell.text.strip() for cell in row.cells]
+                result.append(" | ".join(cells))
+        return "\n".join(result)[:30000] if result else "[DOCX: no text found]"
+    except Exception as e:
+        return f"[DOCX Error: {e}]"
+
+
 def parse_file(file_path, file_name):
     nl = file_name.lower()
     if nl.endswith((".xlsx", ".xls")): return parse_xlsx(file_path)
+    elif nl.endswith(".pdf"): return parse_pdf(file_path)
+    elif nl.endswith(".docx"): return parse_docx(file_path)
     elif nl.endswith((".csv", ".txt", ".md", ".json", ".py", ".js", ".html")):
         try:
             with open(file_path, "r", encoding="utf-8", errors="replace") as f: return f.read(50000)
@@ -380,8 +413,21 @@ def parse_file(file_path, file_name):
 
 
 def fetch_url_text(url):
-    """Fetch URL content. Supports Reddit RSS and general pages."""
+    """Fetch URL content. Supports Reddit RSS, LinkedIn via search, and general pages."""
     try:
+        if "linkedin.com/in/" in url:
+            # LinkedIn blocks direct access — use web search to get profile info
+            username = re.search(r'linkedin\.com/in/([^/?#]+)', url)
+            query = f"site:linkedin.com/in/{username.group(1)}" if username else url
+            headers = {"User-Agent": "Mozilla/5.0 (compatible; bot/1.0)"}
+            search_url = f"https://www.google.com/search?q={urllib.parse.quote(query)}"
+            req = urllib.request.Request(search_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                content = resp.read().decode("utf-8", errors="replace")
+                # Extract visible text snippets
+                snippets = re.findall(r'<span[^>]*>(.*?)</span>', content)
+                clean = [re.sub(r'<[^>]+>', '', s).strip() for s in snippets if len(s) > 30]
+                return "\n".join(clean[:30])[:5000] if clean else "[LinkedIn: profile not accessible]"
         if "reddit.com" in url:
             if re.search(r'reddit\.com/?$', url):
                 url = "https://www.reddit.com/r/popular/.rss?limit=25"
@@ -712,6 +758,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if url_match:
         fetched = fetch_url_text(url_match.group(0))
         extra += f"\n\n[URL CONTENT]\n{fetched}"
+    elif any(kw in tl for kw in ["linkedin.com/in/", "linkedin профил", "linkedin profile"]):
+        ln_match = re.search(r'linkedin\.com/in/[\w-]+', user_text)
+        if ln_match:
+            fetched = fetch_url_text(f"https://www.{ln_match.group(0)}")
+            extra += f"\n\n[LINKEDIN PROFILE]\n{fetched}"
     elif any(kw in tl for kw in ["реддит", "reddit", "r/popular", "r/all"]):
         reddit_match = re.search(r'r/(\w+)', user_text)
         if reddit_match:
