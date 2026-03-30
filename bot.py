@@ -39,6 +39,10 @@ scheduled_jobs: dict[int, list] = defaultdict(list)
 scheduler = AsyncIOScheduler()
 _google_token_cache = {"token": "", "expires": 0}
 
+# Cache: telegram username (lowercase, no @) -> HubSpot contact id
+# Populated after successful contact creation to avoid search index delay
+created_contacts: dict[str, str] = {}
+
 HUBSPOT_BASE = "https://api.hubapi.com"
 LIFECYCLE_STAGES = {
     "subscriber": "Subscriber", "lead": "Lead", "marketingqualifiedlead": "MQL",
@@ -74,16 +78,44 @@ SYSTEM_PROMPT = """You are a personal AI assistant for Daniel (Danil) Tonkopiy.
 Text, forwarded messages, files (xlsx, csv, txt), photos/screenshots, calendar, email, Google Drive.
 
 == HUBSPOT ==
-You have direct access to HubSpot via API. Use the correct tag for each action:
+You have direct access to HubSpot via API. Use the correct tag for each action.
 
-TO CREATE a new contact — output this tag immediately when user says "создай контакт", "добавь контакт", "create contact", "add contact":
-<hubspot_create>{"firstname":"...","lastname":"...","email":"...","phone":"...","lifecyclestage":"lead","hs_lead_status":"NEW","website":"https://t.me/username","notes_initial":"..."}</hubspot_create>
-Use only fields you have data for. "notes_initial" is optional first note.
+=== CREATING A CONTACT ===
+When user says "создай контакт", "добавь контакт", "create contact", "add contact" — IMMEDIATELY output hubspot_create tag.
+
+CRITICAL — DATA EXTRACTION:
+Before outputting the tag, carefully read ALL messages in the conversation (forwarded messages, copied text, user messages) and extract:
+- firstname, lastname: from name mentions, "[FORWARDED from Name Surname]" headers, profile cards, Telegram contact cards
+- email: any @-containing address in the text (e.g. gagkp@mail.ru, andrkrupenko@gmail.com)
+- phone: any phone number in the text (e.g. 3233287890)
+- website: Telegram link if present (https://t.me/username)
+- job_title: professional role if mentioned
+- company: employer if mentioned
+- notes_initial: summary of what the person does / why they are being added
+
+Examples of data to extract:
+- "Forwarded from Иван" → firstname: "Иван"
+- "gagkp@mail.ru" → email: "gagkp@mail.ru"
+- "https://t.me/mariia_valieva" → website: "https://t.me/mariia_valieva"
+- "Filmmaker, Photographer, Designer" → job_title: "Filmmaker, Photographer, Designer"
+- "3233287890" → phone: "3233287890"
+
+DO NOT leave fields empty if the data is visible in the conversation. Extract everything available.
+
+Tag format:
+<hubspot_create>{"firstname":"...","lastname":"...","email":"...","phone":"...","job_title":"...","company":"...","lifecyclestage":"lead","hs_lead_status":"NEW","website":"https://t.me/username","notes_initial":"..."}</hubspot_create>
+
+Use only fields you have actual data for. Omit fields with no data.
 NEVER search before creating. Output hubspot_create tag immediately.
+After outputting hubspot_create, do NOT output hubspot_update or hubspot_contact tags for the same person in the same response.
 
-TO UPDATE an existing contact — for CRM updates after conversation analysis:
-<hubspot_contact>username</hubspot_contact>
+=== UPDATING AN EXISTING CONTACT ===
+For CRM updates after conversation analysis, output both tags:
+<hubspot_contact>telegram_username</hubspot_contact>
 <hubspot_update>{"summary":"...","suggested_lifecycle":"...","suggested_lead_status":"...","suggested_note":"..."}</hubspot_update>
+
+IMPORTANT: Only output hubspot_update if you are confident the contact already exists in HubSpot.
+Do NOT output hubspot_update immediately after a hubspot_create for the same person in the same session.
 
 Lifecycle values: subscriber, lead, marketingqualifiedlead, salesqualifiedlead, opportunity, customer, evangelist, other
 Lead status values: NEW, OPEN, IN_PROGRESS, OPEN_DEAL, UNQUALIFIED, ATTEMPTED_TO_CONTACT, CONNECTED, BAD_TIMING
@@ -421,7 +453,6 @@ def parse_file(file_path, file_name):
 
 
 def fetch_url_text(url):
-    """Fetch URL content. Supports Reddit RSS, LinkedIn via search, and general pages."""
     try:
         if "linkedin.com/in/" in url:
             username = re.search(r'linkedin\.com/in/([^/?#]+)', url)
@@ -481,6 +512,15 @@ def hubspot_request(method, endpoint, data=None):
 
 def search_contact_by_telegram(tg_username):
     u = tg_username.lower().strip().lstrip("@")
+
+    # Check local cache first (bypasses HubSpot search index delay after creation)
+    if u in created_contacts:
+        cid = created_contacts[u]
+        props = ["firstname", "lastname", "email", "phone", "lifecyclestage", "hs_lead_status", "website"]
+        r = hubspot_request("GET", f"/crm/v3/objects/contacts/{cid}?properties={','.join(props)}")
+        if "error" not in r:
+            return [r]
+
     props = ["firstname", "lastname", "email", "phone", "lifecyclestage", "hs_lead_status", "website"]
     for search in [
         {"filterGroups": [{"filters": [{"propertyName": "website", "operator": "CONTAINS_TOKEN", "value": u}]}], "properties": props, "limit": 5},
@@ -506,8 +546,7 @@ def add_note_to_contact(cid, note):
 
 
 def create_hubspot_contact(props):
-    """Create a new contact in HubSpot. props is a dict of HubSpot property key/value pairs."""
-    # Extract optional initial note before sending to API
+    """Create a new contact in HubSpot. Pops notes_initial and creates note after contact creation."""
     note = props.pop("notes_initial", None)
     result = hubspot_request("POST", "/crm/v3/objects/contacts", {"properties": props})
     if "error" not in result and note:
@@ -589,6 +628,7 @@ async def debug_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append("Google: ошибка токена")
     else:
         lines.append("Google: не настроен")
+    lines.append(f"Cached contacts: {list(created_contacts.keys())}")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -853,17 +893,54 @@ async def _process_message(update, chat_id, content, fwd_username=None):
         clean = clean_response(reply)
 
         if hs_create:
-            pending_updates[chat_id] = {"type": "hubspot_create", "data": hs_create}
+            # Extract telegram username from website field for cache key
+            website = hs_create.get("website", "")
+            tg_match = re.search(r't\.me/(\w+)', website)
+            create_username = tg_match.group(1).lower() if tg_match else None
+
+            pending_updates[chat_id] = {
+                "type": "hubspot_create",
+                "data": hs_create,
+                "tg_username": create_username,
+            }
             name = f"{hs_create.get('firstname', '')} {hs_create.get('lastname', '')}".strip() or "—"
             email_val = hs_create.get("email", "—")
+            phone_val = hs_create.get("phone", "")
+            job_val = hs_create.get("job_title", "")
+            company_val = hs_create.get("company", "")
             stage = LIFECYCLE_STAGES.get(hs_create.get("lifecyclestage", ""), hs_create.get("lifecyclestage", "—"))
+            details = f"Имя: {esc(name)}\nEmail: {esc(email_val)}"
+            if phone_val: details += f"\nТел: {esc(phone_val)}"
+            if job_val: details += f"\nДолжность: {esc(job_val)}"
+            if company_val: details += f"\nКомпания: {esc(company_val)}"
+            details += f"\nStage: {esc(stage)}"
+            if website: details += f"\nTelegram: {esc(website)}"
             kb = [[InlineKeyboardButton("✅ Создать", callback_data="hsc_confirm"), InlineKeyboardButton("❌ Отмена", callback_data="hsc_cancel")]]
             await update.message.reply_text(
-                f"{esc(clean)}\n\n━━━━━━━━━━━━━━━\n<b>Создать контакт в HubSpot:</b>\n"
-                f"Имя: {esc(name)}\nEmail: {esc(email_val)}\nStage: {esc(stage)}",
+                f"{esc(clean)}\n\n━━━━━━━━━━━━━━━\n<b>Создать контакт в HubSpot:</b>\n{details}",
                 parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
         elif hs_update and tg_username:
-            await _send_hubspot_update(update, chat_id, hs_update, tg_username, clean)
+            # If this username is in the local cache (just created), apply update directly without search
+            if tg_username.lower() in created_contacts:
+                cid = created_contacts[tg_username.lower()]
+                note = hs_update.get("suggested_note")
+                props = {}
+                lc = hs_update.get("suggested_lifecycle")
+                ls = hs_update.get("suggested_lead_status")
+                if lc: props["lifecyclestage"] = lc
+                if ls: props["hs_lead_status"] = ls
+                if props:
+                    update_contact(cid, props)
+                if note:
+                    add_note_to_contact(cid, note)
+                link = f"https://app.hubspot.com/contacts/47345195/record/0-1/{cid}"
+                await update.message.reply_text(
+                    f"{esc(clean)}\n\n✅ Данные добавлены в контакт.\n<a href=\"{link}\">HubSpot</a>",
+                    parse_mode="HTML", disable_web_page_preview=True)
+            else:
+                await _send_hubspot_update(update, chat_id, hs_update, tg_username, clean)
+
         elif cal_create:
             pending_updates[chat_id] = {"type": "calendar", "data": cal_create}
             kb = [[InlineKeyboardButton("✅ Создать", callback_data="cal_confirm"), InlineKeyboardButton("❌ Отмена", callback_data="cal_cancel")]]
@@ -937,7 +1014,11 @@ async def _send_hubspot_update(update, chat_id, hs_update, tg_username, clean):
             f"Заметка: {esc(hs_update.get('suggested_note', '—'))}\n\n<b>Нажми кнопку:</b>",
             parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
     else:
-        await update.message.reply_text(f"{clean}\n\nКонтакт {tg_username} не найден. /find {tg_username}")
+        # No search spam — just inform and suggest creating
+        await update.message.reply_text(
+            f"{esc(clean)}\n\nКонтакт <b>{esc(tg_username)}</b> не найден в HubSpot.\n"
+            f"Напиши <b>создай контакт</b> чтобы добавить.",
+            parse_mode="HTML")
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -959,11 +1040,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 link = f"https://app.hubspot.com/contacts/47345195/record/0-1/{cid}"
                 d = pending["data"]
                 name = f"{d.get('firstname', '')} {d.get('lastname', '')}".strip() or "—"
+                # Cache username -> contact id to bypass HubSpot search index delay
+                tg_u = pending.get("tg_username")
+                if tg_u:
+                    created_contacts[tg_u.lower()] = cid
                 await q.edit_message_text(
                     f"✅ Контакт <b>{esc(name)}</b> создан!\n<a href=\"{link}\">Открыть в HubSpot</a>",
                     parse_mode="HTML", disable_web_page_preview=True)
             else:
-                await q.edit_message_text(f"Ошибка создания: {pending['data'].get('message', str(r.get('error', '')))[:300]}")
+                await q.edit_message_text(f"Ошибка создания: {str(r.get('message', r.get('error', '')))[:300]}")
         else:
             await q.edit_message_text("Отменено.")
 
