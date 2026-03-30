@@ -74,19 +74,22 @@ SYSTEM_PROMPT = """You are a personal AI assistant for Daniel (Danil) Tonkopiy.
 Text, forwarded messages, files (xlsx, csv, txt), photos/screenshots, calendar, email, Google Drive.
 
 == HUBSPOT ==
-You have access to HubSpot MCP tools. Use them directly when needed:
-- To create a contact: use the HubSpot create_contact tool
-- To find a contact: use the HubSpot search tool
-- Do NOT ask the user for API keys or integrations -- you already have access.
-- When user says "создай контакт" -- immediately call create_contact tool, do not search first.
+You have direct access to HubSpot via API. Use the correct tag for each action:
 
-For CRM updates, include these tags:
+TO CREATE a new contact — output this tag immediately when user says "создай контакт", "добавь контакт", "create contact", "add contact":
+<hubspot_create>{"firstname":"...","lastname":"...","email":"...","phone":"...","lifecyclestage":"lead","hs_lead_status":"NEW","website":"https://t.me/username","notes_initial":"..."}</hubspot_create>
+Use only fields you have data for. "notes_initial" is optional first note.
+NEVER search before creating. Output hubspot_create tag immediately.
+
+TO UPDATE an existing contact — for CRM updates after conversation analysis:
 <hubspot_contact>username</hubspot_contact>
 <hubspot_update>{"summary":"...","suggested_lifecycle":"...","suggested_lead_status":"...","suggested_note":"..."}</hubspot_update>
 
-Lifecycle: subscriber, lead, marketingqualifiedlead, salesqualifiedlead, opportunity, customer, evangelist, other
-Lead status: NEW, OPEN, IN_PROGRESS, OPEN_DEAL, UNQUALIFIED, ATTEMPTED_TO_CONTACT, CONNECTED, BAD_TIMING
-NEVER say "I updated HubSpot" — only the system can after button click.
+Lifecycle values: subscriber, lead, marketingqualifiedlead, salesqualifiedlead, opportunity, customer, evangelist, other
+Lead status values: NEW, OPEN, IN_PROGRESS, OPEN_DEAL, UNQUALIFIED, ATTEMPTED_TO_CONTACT, CONNECTED, BAD_TIMING
+
+NEVER say "I updated HubSpot" or "I created the contact" — only the system can after button click confirmation.
+Do NOT ask for API keys — you already have access.
 
 == CALENDAR ==
 When [CALENDAR DATA] is provided, analyze and answer. To create events:
@@ -98,7 +101,6 @@ When [GMAIL DATA] is provided, analyze and summarize. To send:
 To save as draft (use when email address is unknown or user wants to review first):
 <gmail_draft>{"to":"...","subject":"...","body":"..."}</gmail_draft>
 Daniel must confirm before sending. For drafts, "to" can be empty string if address unknown.
-Daniel must confirm before sending.
 
 == GOOGLE DRIVE ==
 When [DRIVE DATA] is provided, analyze the files/content. You can see file names, types, and content when provided.
@@ -422,7 +424,6 @@ def fetch_url_text(url):
     """Fetch URL content. Supports Reddit RSS, LinkedIn via search, and general pages."""
     try:
         if "linkedin.com/in/" in url:
-            # LinkedIn blocks direct access — use web search to get profile info
             username = re.search(r'linkedin\.com/in/([^/?#]+)', url)
             query = f"site:linkedin.com/in/{username.group(1)}" if username else url
             headers = {"User-Agent": "Mozilla/5.0 (compatible; bot/1.0)"}
@@ -430,7 +431,6 @@ def fetch_url_text(url):
             req = urllib.request.Request(search_url, headers=headers)
             with urllib.request.urlopen(req, timeout=10) as resp:
                 content = resp.read().decode("utf-8", errors="replace")
-                # Extract visible text snippets
                 snippets = re.findall(r'<span[^>]*>(.*?)</span>', content)
                 clean = [re.sub(r'<[^>]+>', '', s).strip() for s in snippets if len(s) > 30]
                 return "\n".join(clean[:30])[:5000] if clean else "[LinkedIn: profile not accessible]"
@@ -494,11 +494,27 @@ def search_contact_by_telegram(tg_username):
         if result and "results" in result and result["results"]: return result["results"]
     return []
 
-def update_contact(cid, props): return hubspot_request("PATCH", f"/crm/v3/objects/contacts/{cid}", {"properties": props})
+
+def update_contact(cid, props):
+    return hubspot_request("PATCH", f"/crm/v3/objects/contacts/{cid}", {"properties": props})
+
+
 def add_note_to_contact(cid, note):
     return hubspot_request("POST", "/crm/v3/objects/notes", {
         "properties": {"hs_note_body": note, "hs_timestamp": str(int(time.time() * 1000))},
         "associations": [{"to": {"id": cid}, "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 202}]}]})
+
+
+def create_hubspot_contact(props):
+    """Create a new contact in HubSpot. props is a dict of HubSpot property key/value pairs."""
+    # Extract optional initial note before sending to API
+    note = props.pop("notes_initial", None)
+    result = hubspot_request("POST", "/crm/v3/objects/contacts", {"properties": props})
+    if "error" not in result and note:
+        cid = result.get("id")
+        if cid:
+            add_note_to_contact(cid, note)
+    return result
 
 
 # === TAG EXTRACTION ===
@@ -515,7 +531,7 @@ def extract_tag_text(text, tag):
     return match.group(1).strip() if match else None
 
 def clean_response(text):
-    for tag in ["hubspot_update", "hubspot_contact", "calendar_create", "gmail_send", "gmail_draft"]:
+    for tag in ["hubspot_update", "hubspot_contact", "hubspot_create", "calendar_create", "gmail_send", "gmail_draft"]:
         text = re.sub(rf"<{tag}>.*?</{tag}>", "", text, flags=re.DOTALL)
     return text.strip()
 
@@ -826,6 +842,8 @@ async def _process_message(update, chat_id, content, fwd_username=None):
             if hasattr(block, "text")
         )
         conversations[chat_id].append({"role": "assistant", "content": reply})
+
+        hs_create = extract_tag_json(reply, "hubspot_create")
         hs_update = extract_tag_json(reply, "hubspot_update")
         tg_username = extract_tag_text(reply, "hubspot_contact") or fwd_username
         if tg_username: tg_username = tg_username.lstrip("@")
@@ -833,7 +851,18 @@ async def _process_message(update, chat_id, content, fwd_username=None):
         email_send = extract_tag_json(reply, "gmail_send")
         email_draft = extract_tag_json(reply, "gmail_draft")
         clean = clean_response(reply)
-        if hs_update and tg_username:
+
+        if hs_create:
+            pending_updates[chat_id] = {"type": "hubspot_create", "data": hs_create}
+            name = f"{hs_create.get('firstname', '')} {hs_create.get('lastname', '')}".strip() or "—"
+            email_val = hs_create.get("email", "—")
+            stage = LIFECYCLE_STAGES.get(hs_create.get("lifecyclestage", ""), hs_create.get("lifecyclestage", "—"))
+            kb = [[InlineKeyboardButton("✅ Создать", callback_data="hsc_confirm"), InlineKeyboardButton("❌ Отмена", callback_data="hsc_cancel")]]
+            await update.message.reply_text(
+                f"{esc(clean)}\n\n━━━━━━━━━━━━━━━\n<b>Создать контакт в HubSpot:</b>\n"
+                f"Имя: {esc(name)}\nEmail: {esc(email_val)}\nStage: {esc(stage)}",
+                parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+        elif hs_update and tg_username:
             await _send_hubspot_update(update, chat_id, hs_update, tg_username, clean)
         elif cal_create:
             pending_updates[chat_id] = {"type": "calendar", "data": cal_create}
@@ -922,7 +951,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     t = pending.get("type", "hubspot")
 
-    if t == "hubspot":
+    if t == "hubspot_create":
+        if q.data == "hsc_confirm":
+            r = create_hubspot_contact(dict(pending["data"]))
+            if "error" not in r:
+                cid = r["id"]
+                link = f"https://app.hubspot.com/contacts/47345195/record/0-1/{cid}"
+                d = pending["data"]
+                name = f"{d.get('firstname', '')} {d.get('lastname', '')}".strip() or "—"
+                await q.edit_message_text(
+                    f"✅ Контакт <b>{esc(name)}</b> создан!\n<a href=\"{link}\">Открыть в HubSpot</a>",
+                    parse_mode="HTML", disable_web_page_preview=True)
+            else:
+                await q.edit_message_text(f"Ошибка создания: {pending['data'].get('message', str(r.get('error', '')))[:300]}")
+        else:
+            await q.edit_message_text("Отменено.")
+
+    elif t == "hubspot":
         cid = pending["contact_id"]
         name = pending["contact_name"]
         link = f"https://app.hubspot.com/contacts/47345195/record/0-1/{cid}"
@@ -952,18 +997,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else: await q.edit_message_text(f"Ошибка: {r.get('message','')[:500]}")
         elif q.data == "hs_cancel":
             await q.edit_message_text("Отменено.")
+
     elif t == "calendar":
         if q.data == "cal_confirm":
             d = pending["data"]
             r = create_calendar_event(d["summary"], d["start"], d["end"], d.get("description", ""))
             await q.edit_message_text(f"✅ Событие создано: {d['summary']}" if "error" not in r else f"Ошибка: {r.get('message','')[:300]}")
         else: await q.edit_message_text("Отменено.")
+
     elif t == "email":
         if q.data == "email_confirm":
             d = pending["data"]
             r = send_email(d["to"], d["subject"], d["body"])
             await q.edit_message_text(f"✅ Письмо отправлено: {d['to']}" if "error" not in r else f"Ошибка: {r.get('message','')[:300]}")
         else: await q.edit_message_text("Отменено.")
+
     elif t == "draft":
         if q.data == "draft_confirm":
             d = pending["data"]
