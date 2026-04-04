@@ -128,6 +128,28 @@ When [HUBSPOT CONTACTS] is provided — present the contacts clearly with key de
 When [HUBSPOT DEALS] is provided — analyze pipeline, amounts, stages.
 The system automatically searches HubSpot when you mention contacts, tasks, or deals. Just answer based on the data provided.
 
+=== CREATING A TASK ===
+When user says "поставь задачу", "создай задачу", "напомни", "task", "follow up" — output:
+<hubspot_task>{"subject":"Task title","body":"Details","priority":"HIGH","due_date":"milliseconds_epoch_or_null","contact_id":"optional_contact_id"}</hubspot_task>
+Priority: HIGH, MEDIUM, LOW. If no due date specified, default is tomorrow.
+Examples: "поставь задачу позвонить Олегу" → create task with subject "Позвонить Олегу"
+"напомни проверить оплату завтра" → task with subject, due tomorrow
+
+=== EDITING A CONTACT ===
+When user says "добавь емейл", "измени телефон", "обнови компанию", "поменяй статус" for a specific contact:
+<hubspot_edit>{"search":"contact name or identifier","updates":{"email":"new@email.com"}}</hubspot_edit>
+Updatable fields: email, phone, firstname, lastname, company, jobtitle, lifecyclestage, hs_lead_status, website
+Examples: "добавь емейл test@mail.com клиенту Виктор" → search "Виктор", updates {"email":"test@mail.com"}
+"поменяй статус на SQL для Олега" → search "Олег", updates {"hs_lead_status":"SQL"}
+
+=== CREATING A DEAL ===
+When user says "создай сделку", "новая сделка", "create deal":
+<hubspot_deal>{"name":"Deal name","stage":"appointmentscheduled","amount":"5000","contact_id":"optional"}</hubspot_deal>
+
+=== COMPLETING A TASK ===
+When user says "закрой задачу", "задача выполнена", "complete task" and task ID is known:
+<hubspot_complete_task>task_id</hubspot_complete_task>
+
 === CREATING A CONTACT ===
 When user says "создай контакт", "добавь контакт", "create contact", "add contact" — IMMEDIATELY output hubspot_create tag.
 
@@ -733,6 +755,67 @@ def create_hubspot_contact(props):
     return result
 
 
+def create_hubspot_task(subject, body="", due_date=None, priority="MEDIUM", owner_id=None, contact_id=None):
+    """Create a task in HubSpot."""
+    props = {
+        "hs_task_subject": subject,
+        "hs_task_status": "NOT_STARTED",
+        "hs_task_priority": priority,
+        "hs_task_type": "TODO",
+    }
+    if body:
+        props["hs_task_body"] = body
+    if due_date:
+        props["hs_timestamp"] = due_date  # milliseconds since epoch
+    else:
+        # Default: tomorrow 9am PT
+        from datetime import timezone
+        tomorrow = datetime.now(timezone.utc).replace(hour=17, minute=0, second=0) + timedelta(days=1)
+        props["hs_timestamp"] = str(int(tomorrow.timestamp() * 1000))
+    if owner_id:
+        props["hubspot_owner_id"] = owner_id
+
+    data = {"properties": props}
+    if contact_id:
+        data["associations"] = [{"to": {"id": contact_id}, "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 204}]}]
+
+    return hubspot_request("POST", "/crm/v3/objects/tasks", data)
+
+
+def edit_hubspot_contact(search_query, updates):
+    """Find a contact by name/email and update their fields."""
+    contacts, err = search_hubspot_contacts(search_query)
+    if err or not contacts:
+        return {"error": f"Contact '{search_query}' not found"}
+    contact = contacts[0]
+    cid = contact["id"]
+    result = update_contact(cid, updates)
+    if "error" not in result:
+        result["_found_name"] = f"{contact['properties'].get('firstname', '')} {contact['properties'].get('lastname', '')}".strip()
+        result["_contact_id"] = cid
+    return result
+
+
+def create_hubspot_deal(name, stage="appointmentscheduled", amount=None, contact_id=None, pipeline="default"):
+    """Create a deal in HubSpot."""
+    props = {
+        "dealname": name,
+        "dealstage": stage,
+        "pipeline": pipeline,
+    }
+    if amount:
+        props["amount"] = str(amount)
+    data = {"properties": props}
+    if contact_id:
+        data["associations"] = [{"to": {"id": contact_id}, "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 3}]}]
+    return hubspot_request("POST", "/crm/v3/objects/deals", data)
+
+
+def complete_hubspot_task(task_id):
+    """Mark a task as completed."""
+    return hubspot_request("PATCH", f"/crm/v3/objects/tasks/{task_id}", {"properties": {"hs_task_status": "COMPLETED"}})
+
+
 # === TAG EXTRACTION ===
 
 def extract_tag_json(text, tag):
@@ -747,7 +830,8 @@ def extract_tag_text(text, tag):
     return match.group(1).strip() if match else None
 
 def clean_response(text):
-    for tag in ["hubspot_update", "hubspot_contact", "hubspot_create", "calendar_create", "gmail_send", "gmail_draft"]:
+    for tag in ["hubspot_update", "hubspot_contact", "hubspot_create", "hubspot_task", "hubspot_edit",
+                "hubspot_deal", "hubspot_complete_task", "calendar_create", "gmail_send", "gmail_draft"]:
         text = re.sub(rf"<{tag}>.*?</{tag}>", "", text, flags=re.DOTALL)
     return text.strip()
 
@@ -1117,6 +1201,10 @@ async def _process_message(update, chat_id, content, fwd_username=None):
         hs_update = extract_tag_json(reply, "hubspot_update")
         tg_username = extract_tag_text(reply, "hubspot_contact") or fwd_username
         if tg_username: tg_username = tg_username.lstrip("@")
+        hs_task = extract_tag_json(reply, "hubspot_task")
+        hs_edit = extract_tag_json(reply, "hubspot_edit")
+        hs_deal = extract_tag_json(reply, "hubspot_deal")
+        hs_complete = extract_tag_text(reply, "hubspot_complete_task")
         cal_create = extract_tag_json(reply, "calendar_create")
         email_send = extract_tag_json(reply, "gmail_send")
         email_draft = extract_tag_json(reply, "gmail_draft")
@@ -1192,6 +1280,70 @@ async def _process_message(update, chat_id, content, fwd_username=None):
                 f"{esc(clean)}\n\n——————————\n<b>Черновик:</b>\nTo: {esc(email_draft.get('to','(не указан)'))}\n"
                 f"Subject: {esc(email_draft.get('subject',''))}\n{esc(email_draft.get('body','')[:200])}...",
                 parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+        elif hs_task:
+            # Create HubSpot task immediately (no confirmation needed for tasks)
+            result = create_hubspot_task(
+                subject=hs_task.get("subject", "Task"),
+                body=hs_task.get("body", ""),
+                due_date=hs_task.get("due_date"),
+                priority=hs_task.get("priority", "MEDIUM"),
+                contact_id=hs_task.get("contact_id"),
+            )
+            if "error" not in result:
+                tid = result.get("id", "?")
+                await update.message.reply_text(
+                    f"{esc(clean)}\n\n✅ Задача создана в HubSpot (ID: {tid})",
+                    parse_mode="HTML")
+            else:
+                await update.message.reply_text(
+                    f"{esc(clean)}\n\n❌ Ошибка: {esc(str(result.get('message', result.get('error', '?')))[:200])}",
+                    parse_mode="HTML")
+
+        elif hs_edit:
+            # Edit contact fields: {"search": "Виктор", "updates": {"email": "x@y.com"}}
+            search_q = hs_edit.get("search", "")
+            updates = hs_edit.get("updates", {})
+            if search_q and updates:
+                result = edit_hubspot_contact(search_q, updates)
+                if "error" not in result:
+                    name = result.get("_found_name", search_q)
+                    cid = result.get("_contact_id", "")
+                    link = f"https://app.hubspot.com/contacts/47345195/record/0-1/{cid}"
+                    fields = ", ".join(f"{k}={v}" for k, v in updates.items())
+                    await update.message.reply_text(
+                        f"{esc(clean)}\n\n✅ Обновлён <b>{esc(name)}</b>: {esc(fields)}\n<a href=\"{link}\">HubSpot</a>",
+                        parse_mode="HTML", disable_web_page_preview=True)
+                else:
+                    await update.message.reply_text(
+                        f"{esc(clean)}\n\n❌ {esc(str(result.get('error', '?'))[:200])}",
+                        parse_mode="HTML")
+            else:
+                await _send_reply(update, clean)
+
+        elif hs_deal:
+            result = create_hubspot_deal(
+                name=hs_deal.get("name", "Deal"),
+                stage=hs_deal.get("stage", "appointmentscheduled"),
+                amount=hs_deal.get("amount"),
+                contact_id=hs_deal.get("contact_id"),
+            )
+            if "error" not in result:
+                did = result.get("id", "?")
+                await update.message.reply_text(
+                    f"{esc(clean)}\n\n✅ Сделка создана (ID: {did})",
+                    parse_mode="HTML")
+            else:
+                await update.message.reply_text(
+                    f"{esc(clean)}\n\n❌ Ошибка: {esc(str(result.get('message', '?'))[:200])}",
+                    parse_mode="HTML")
+
+        elif hs_complete:
+            result = complete_hubspot_task(hs_complete.strip())
+            if "error" not in result:
+                await update.message.reply_text(f"{esc(clean)}\n\n✅ Задача закрыта.", parse_mode="HTML")
+            else:
+                await update.message.reply_text(f"{esc(clean)}\n\n❌ Ошибка: {esc(str(result)[:200])}", parse_mode="HTML")
+
         else:
             await _send_reply(update, clean)
     except asyncio.TimeoutError:
