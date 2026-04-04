@@ -129,6 +129,14 @@ The system auto-injects HubSpot data into your context when the user mentions co
 - [HUBSPOT DEALS] — analyze pipeline, amounts, stages.
 IMPORTANT: If HubSpot data sections appear in the message, USE THEM. Never claim you lack access when data is right there.
 
+=== SEARCHING CONTACTS ===
+When user asks to find someone, or you need to find a contact to link a task/deal/update:
+<hubspot_search>search query</hubspot_search>
+The system will search and show results. Use full name if available.
+Examples: "найди Олега" → <hubspot_search>Олег</hubspot_search>
+"добавь таску клиенту Viktor" → first search: <hubspot_search>Viktor</hubspot_search>, then create task with found contact_id.
+IMPORTANT: When you need to perform an action on a contact (add task, edit field, etc.), ALWAYS search first to get the contact_id. Output the search tag BEFORE the action tag.
+
 === CREATING A TASK ===
 When user says "поставь задачу", "создай задачу", "напомни", "task", "follow up" — output:
 <hubspot_task>{"subject":"Task title","body":"Details","priority":"HIGH","due_date":"milliseconds_epoch_or_null","contact_id":"optional_contact_id"}</hubspot_task>
@@ -900,8 +908,8 @@ def extract_tag_text(text, tag):
     return match.group(1).strip() if match else None
 
 def clean_response(text):
-    for tag in ["hubspot_update", "hubspot_contact", "hubspot_create", "hubspot_task", "hubspot_edit",
-                "hubspot_deal", "hubspot_complete_task", "calendar_create", "gmail_send", "gmail_draft"]:
+    for tag in ["hubspot_update", "hubspot_contact", "hubspot_create", "hubspot_search", "hubspot_task",
+                "hubspot_edit", "hubspot_deal", "hubspot_complete_task", "calendar_create", "gmail_send", "gmail_draft"]:
         text = re.sub(rf"<{tag}>.*?</{tag}>", "", text, flags=re.DOTALL)
     return text.strip()
 
@@ -1273,6 +1281,34 @@ async def _process_message(update, chat_id, content, fwd_username=None):
             if hasattr(block, "text")
         )
         conversations[chat_id].append({"role": "assistant", "content": reply})
+
+        # Check if Claude wants to search HubSpot first
+        hs_search_q = extract_tag_text(reply, "hubspot_search")
+        if hs_search_q:
+            # Execute search and re-run Claude with results
+            contacts, _ = search_hubspot_contacts(hs_search_q.strip())
+            search_data = format_contacts_for_claude(contacts) if contacts else "[HUBSPOT CONTACTS]\nNo contacts found."
+            # Remove search tag from reply, keep the rest
+            clean_partial = re.sub(r"<hubspot_search>.*?</hubspot_search>", "", reply, flags=re.DOTALL).strip()
+            # Feed search results back to Claude for the actual action
+            conversations[chat_id].append({"role": "assistant", "content": reply})
+            follow_up = f"[SEARCH RESULTS for '{hs_search_q}']\n{search_data}\n\nNow complete the user's original request using the contact_id from results above."
+            if contacts:
+                c = contacts[0]
+                follow_up += f"\nFirst match: ID={c['id']}, {c['properties'].get('firstname','')} {c['properties'].get('lastname','')}"
+            conversations[chat_id].append({"role": "user", "content": follow_up})
+            # Second Claude call with search results
+            response2 = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: client.messages.create(
+                        model=MODEL, max_tokens=4096, system=SYSTEM_PROMPT,
+                        messages=conversations[chat_id],
+                    )
+                ), timeout=60
+            )
+            reply = "\n".join(block.text for block in response2.content if hasattr(block, "text"))
+            conversations[chat_id].append({"role": "assistant", "content": reply})
 
         hs_create = extract_tag_json(reply, "hubspot_create")
         hs_update = extract_tag_json(reply, "hubspot_update")
