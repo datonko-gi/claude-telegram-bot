@@ -121,6 +121,8 @@ Text, forwarded messages, files (xlsx, csv, txt), photos/screenshots, calendar, 
 
 == HUBSPOT ==
 You have direct access to HubSpot via API. Use the correct tag for each action.
+When asked about tasks ("таски", "задачи", "что делать"), and [HUBSPOT TASKS] data is provided, analyze and summarize them clearly — what's overdue, what's due today, priorities.
+When asked about tasks but NO [HUBSPOT TASKS] data is provided, tell the user to run /tasks command.
 
 === CREATING A CONTACT ===
 When user says "создай контакт", "добавь контакт", "create contact", "add contact" — IMMEDIATELY output hubspot_create tag.
@@ -587,6 +589,85 @@ def add_note_to_contact(cid, note):
         "associations": [{"to": {"id": cid}, "types": [{"associationCategory": "HUBSPOT_DEFINED", "associationTypeId": 202}]}]})
 
 
+def get_hubspot_tasks(status="NOT_STARTED", include_overdue=True):
+    """Get HubSpot tasks filtered by status. Returns today's + overdue tasks."""
+    now = datetime.now(timezone.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_end = today_start + timedelta(days=1)
+
+    filters = []
+    if status:
+        filters.append({"propertyName": "hs_task_status", "operator": "EQ", "value": status})
+
+    # Get tasks due today or overdue
+    if include_overdue:
+        filters.append({"propertyName": "hs_timestamp", "operator": "LTE", "value": str(int(today_end.timestamp() * 1000))})
+
+    props = ["hs_task_subject", "hs_task_body", "hs_timestamp", "hs_task_status",
+             "hs_task_priority", "hs_task_type", "hubspot_owner_id"]
+    data = {
+        "filterGroups": [{"filters": filters}] if filters else [],
+        "properties": props,
+        "sorts": [{"propertyName": "hs_timestamp", "direction": "ASCENDING"}],
+        "limit": 50,
+    }
+    result = hubspot_request("POST", "/crm/v3/objects/tasks/search", data)
+    if "error" in result:
+        return None, str(result.get("message", result["error"]))
+    return result.get("results", []), None
+
+
+def format_tasks(tasks):
+    if not tasks:
+        return "Нет задач."
+    lines = []
+    now = datetime.now(timezone.utc)
+    for t in tasks:
+        p = t.get("properties", {})
+        subject = p.get("hs_task_subject", "Без темы")
+        status = p.get("hs_task_status", "?")
+        priority = p.get("hs_task_priority", "")
+        ts = p.get("hs_timestamp", "")
+        overdue = ""
+        if ts:
+            try:
+                due = datetime.fromtimestamp(int(ts) / 1000, tz=timezone.utc)
+                due_str = due.strftime("%d.%m %H:%M")
+                if due < now:
+                    overdue = " ⚠️ ПРОСРОЧЕНА"
+            except:
+                due_str = ts[:10]
+        else:
+            due_str = "без даты"
+        prio = f" [{priority.upper()}]" if priority and priority != "NONE" else ""
+        lines.append(f"{'🔴' if overdue else '🔵'} {subject}{prio}\n   До: {due_str}{overdue}")
+    return "\n\n".join(lines)
+
+
+def format_tasks_for_claude(tasks):
+    if not tasks:
+        return "[HUBSPOT TASKS]\nNo tasks found."
+    lines = ["[HUBSPOT TASKS]"]
+    now = datetime.now(timezone.utc)
+    for t in tasks:
+        p = t.get("properties", {})
+        ts = p.get("hs_timestamp", "")
+        overdue = ""
+        if ts:
+            try:
+                due = datetime.fromtimestamp(int(ts) / 1000, tz=timezone.utc)
+                if due < now:
+                    overdue = " [OVERDUE]"
+            except:
+                pass
+        line = f"- {p.get('hs_task_subject', 'No title')} | status: {p.get('hs_task_status', '?')} | priority: {p.get('hs_task_priority', 'NONE')} | due: {ts}{overdue}"
+        body = p.get("hs_task_body", "")
+        if body:
+            line += f"\n  Notes: {body[:200]}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def create_hubspot_contact(props):
     """Create a new contact in HubSpot. Pops notes_initial and creates note after contact creation."""
     note = props.pop("notes_initial", None)
@@ -630,6 +711,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     g = "подключен" if GOOGLE_REFRESH_TOKEN else "не настроен"
     await update.message.reply_text(
         "AI-ассистент с HubSpot, Calendar, Gmail и Drive.\n\n"
+        "/tasks — задачи на сегодня + просроченные\n"
         "/cal — расписание на сегодня\n"
         "/cal3 — на 3 дня\n"
         "/mail — непрочитанные письма\n"
@@ -730,6 +812,23 @@ async def drive_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Файлов не найдено.")
         return
     text = f"{label}:\n\n{format_drive_files(files)}"
+    await update.message.reply_text(text[:4096])
+
+
+async def tasks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.username): return
+    if not HUBSPOT_API_KEY:
+        await update.message.reply_text("HubSpot не настроен.")
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    tasks, err = get_hubspot_tasks()
+    if err:
+        await update.message.reply_text(f"Ошибка: {err[:200]}")
+        return
+    if not tasks:
+        await update.message.reply_text("Нет задач на сегодня и просроченных 🎉")
+        return
+    text = f"Задачи ({len(tasks)}):\n\n{format_tasks(tasks)}"
     await update.message.reply_text(text[:4096])
 
 
@@ -857,6 +956,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if any(kw in tl for kw in drive_kw):
             df, _ = drive_list_recent(10)
             if df: extra += "\n\n" + format_drive_for_claude(df)
+    if HUBSPOT_API_KEY:
+        task_kw = ["таск", "задач", "task", "что делать", "что на сегодня", "просроч", "overdue", "to do", "todo", "хабспот"]
+        if any(kw in tl for kw in task_kw):
+            tasks, _ = get_hubspot_tasks()
+            if tasks: extra += "\n\n" + format_tasks_for_claude(tasks)
 
     url_match = re.search(r'https?://\S+', user_text)
     if url_match:
@@ -1218,7 +1322,7 @@ async def handle_cancel_schedule(update, chat_id, user_text):
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     for cmd, fn in [("start", start), ("reset", reset), ("debug", debug_cmd), ("cal", calendar_cmd),
-                    ("mail", mail_cmd), ("drive", drive_cmd), ("model", model_info), ("setmodel", set_model), ("find", find_contact)]:
+                    ("mail", mail_cmd), ("drive", drive_cmd), ("tasks", tasks_cmd), ("model", model_info), ("setmodel", set_model), ("find", find_contact)]:
         app.add_handler(CommandHandler(cmd, fn))
     for i in range(1, 15):
         app.add_handler(CommandHandler(f"cal{i}", calendar_cmd))
