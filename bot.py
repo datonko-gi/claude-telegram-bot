@@ -708,12 +708,67 @@ CYR_TO_LAT = {"а":"a","б":"b","в":"v","г":"g","д":"d","е":"e","ё":"yo","�
     "ц":"ts","ч":"ch","ш":"sh","щ":"shch","ъ":"","ы":"y","ь":"","э":"e","ю":"yu","я":"ya",
     "і":"i","ї":"yi","є":"ye","ґ":"g"}
 
+# Common Cyrillic name → known Latin variants (covers Ukrainian transliteration variants)
+NAME_VARIANTS = {
+    "сергей": ["sergey", "serhii", "sergii", "sergei", "sergio"],
+    "сергій": ["serhii", "sergiy", "sergei", "sergey"],
+    "олег": ["oleg", "oleh"],
+    "виктор": ["viktor", "victor"],
+    "віктор": ["viktor", "victor"],
+    "дмитро": ["dmytro", "dmitro", "dmitry"],
+    "дмитрий": ["dmitry", "dmitrii", "dmytro", "dmitri"],
+    "андрей": ["andrey", "andrii", "andriy", "andrei"],
+    "андрій": ["andriy", "andrii", "andrey"],
+    "олександр": ["oleksandr", "alexander", "alexandr"],
+    "александр": ["alexander", "alexandr", "oleksandr"],
+    "михаил": ["mikhail", "mykhailo", "michael"],
+    "артем": ["artem", "artom"],
+    "артём": ["artem", "artyom"],
+    "евгений": ["evgeny", "yevhen", "evgeniy", "eugene"],
+    "євген": ["yevhen", "evgen", "eugene"],
+    "николай": ["nikolay", "mykola", "nikolai"],
+    "микола": ["mykola", "nikolay"],
+    "иван": ["ivan"],
+    "іван": ["ivan"],
+    "павел": ["pavel", "pavlo"],
+    "павло": ["pavlo", "pavel"],
+    "максим": ["maksym", "maxim", "maksim"],
+    "алексей": ["aleksey", "oleksii", "alexey", "alexei"],
+    "олексій": ["oleksii", "aleksey", "alexey"],
+    "владимир": ["vladimir", "volodymyr"],
+    "володимир": ["volodymyr", "vladimir"],
+    "карина": ["karina"],
+    "татьяна": ["tatiana", "tatyana", "tetiana"],
+    "тетяна": ["tetiana", "tatiana"],
+    "наталья": ["natalia", "nataliya", "natasha"],
+    "наталія": ["nataliya", "natalia"],
+    "елена": ["elena", "olena", "helen"],
+    "олена": ["olena", "elena"],
+    "анна": ["anna", "hanna"],
+    "ганна": ["hanna", "anna"],
+    "ирина": ["irina", "iryna"],
+    "ірина": ["iryna", "irina"],
+    "семен": ["semen", "semyon", "simon"],
+}
+
 def transliterate(text):
     """Transliterate Cyrillic to Latin."""
     result = []
     for ch in text.lower():
         result.append(CYR_TO_LAT.get(ch, ch))
     return "".join(result).title()
+
+def get_name_variants(name):
+    """Get all possible Latin variants of a Cyrillic name."""
+    name_lower = name.lower().strip()
+    variants = set()
+    # Direct transliteration
+    variants.add(transliterate(name))
+    # Known variants
+    if name_lower in NAME_VARIANTS:
+        for v in NAME_VARIANTS[name_lower]:
+            variants.add(v.title())
+    return list(variants)
 
 def is_cyrillic(text):
     return any("\u0400" <= ch <= "\u04ff" for ch in text)
@@ -746,19 +801,20 @@ def search_hubspot_contacts(query, limit=20):
             for c in result["results"]:
                 all_results[c["id"]] = c
 
-    # If Cyrillic query, also try Latin transliteration
+    # If Cyrillic query, try all known Latin variants
     if is_cyrillic(query):
-        lat = transliterate(query)
-        for search_term in [lat]:
-            data = {"query": search_term, "properties": props, "limit": limit}
+        variants = get_name_variants(query)
+        for variant in variants:
+            # query search
+            data = {"query": variant, "properties": props, "limit": limit}
             result = hubspot_request("POST", "/crm/v3/objects/contacts/search", data)
             if "results" in result:
                 for c in result["results"]:
                     all_results[c["id"]] = c
-            # CONTAINS_TOKEN too
+            # CONTAINS_TOKEN on firstname
             data2 = {
                 "filterGroups": [{"filters": [
-                    {"propertyName": "firstname", "operator": "CONTAINS_TOKEN", "value": search_term.strip()}
+                    {"propertyName": "firstname", "operator": "CONTAINS_TOKEN", "value": variant.strip()}
                 ]}],
                 "properties": props, "limit": limit
             }
@@ -767,8 +823,11 @@ def search_hubspot_contacts(query, limit=20):
                 for c in result2["results"]:
                     all_results[c["id"]] = c
 
-    # Also try lastname
-    for search_term in [query] + ([transliterate(query)] if is_cyrillic(query) else []):
+    # Also try lastname with all variants
+    search_terms = [query]
+    if is_cyrillic(query):
+        search_terms.extend(get_name_variants(query))
+    for search_term in search_terms:
         data = {
             "filterGroups": [{"filters": [
                 {"propertyName": "lastname", "operator": "CONTAINS_TOKEN", "value": search_term.strip()}
@@ -1282,22 +1341,18 @@ async def _process_message(update, chat_id, content, fwd_username=None):
         )
         conversations[chat_id].append({"role": "assistant", "content": reply})
 
-        # Check if Claude wants to search HubSpot first
+        # Check if Claude wants to search HubSpot first (two-phase: search → act)
         hs_search_q = extract_tag_text(reply, "hubspot_search")
         if hs_search_q:
-            # Execute search and re-run Claude with results
             contacts, _ = search_hubspot_contacts(hs_search_q.strip())
-            search_data = format_contacts_for_claude(contacts) if contacts else "[HUBSPOT CONTACTS]\nNo contacts found."
-            # Remove search tag from reply, keep the rest
-            clean_partial = re.sub(r"<hubspot_search>.*?</hubspot_search>", "", reply, flags=re.DOTALL).strip()
-            # Feed search results back to Claude for the actual action
-            conversations[chat_id].append({"role": "assistant", "content": reply})
-            follow_up = f"[SEARCH RESULTS for '{hs_search_q}']\n{search_data}\n\nNow complete the user's original request using the contact_id from results above."
+            search_data = format_contacts_for_claude(contacts) if contacts else "[HUBSPOT CONTACTS]\nNo contacts found for '" + hs_search_q + "'."
+            # Don't show intermediate reply to user — feed results back to Claude silently
+            conversations[chat_id][-1] = {"role": "assistant", "content": clean_response(reply) or "Searching..."}
+            follow_up = f"[SEARCH RESULTS for '{hs_search_q}']\n{search_data}\n\nNow complete the user's original request using the contact_id from results above. Do NOT output another hubspot_search tag."
             if contacts:
                 c = contacts[0]
                 follow_up += f"\nFirst match: ID={c['id']}, {c['properties'].get('firstname','')} {c['properties'].get('lastname','')}"
             conversations[chat_id].append({"role": "user", "content": follow_up})
-            # Second Claude call with search results
             response2 = await asyncio.wait_for(
                 asyncio.get_event_loop().run_in_executor(
                     None,
@@ -1483,8 +1538,14 @@ def md_to_html(text):
 async def _send_reply(update, text):
     if not text: text = "(пустой ответ)"
     text = md_to_html(text)
+    # Remove any leftover XML-like tags that Telegram would choke on
+    text = re.sub(r'<(?!/?(?:b|i|u|s|code|pre|a)\b)[^>]+>', '', text)
     for i in range(0, len(text), 4096):
-        await update.message.reply_text(text[i:i+4096], parse_mode="HTML")
+        try:
+            await update.message.reply_text(text[i:i+4096], parse_mode="HTML")
+        except Exception:
+            # Fallback: send without HTML parsing
+            await update.message.reply_text(text[i:i+4096])
 
 
 async def _send_hubspot_update(update, chat_id, hs_update, tg_username, clean):
