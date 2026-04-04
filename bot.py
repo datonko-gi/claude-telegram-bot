@@ -120,9 +120,13 @@ KazMunayGas (geophysicist, gas station network 6→500+, sold $500M) → best.ua
 Text, forwarded messages, files (xlsx, csv, txt), photos/screenshots, calendar, email, Google Drive.
 
 == HUBSPOT ==
-You have direct access to HubSpot via API. Use the correct tag for each action.
-When asked about tasks ("таски", "задачи", "что делать"), and [HUBSPOT TASKS] data is provided, analyze and summarize them clearly — what's overdue, what's due today, priorities.
-When asked about tasks but NO [HUBSPOT TASKS] data is provided, tell the user to run /tasks command.
+You have FULL direct access to HubSpot via API. The system auto-fetches relevant data when it detects keywords.
+
+=== READING DATA (automatic) ===
+When [HUBSPOT TASKS] is provided — analyze: what's overdue, due today, priorities.
+When [HUBSPOT CONTACTS] is provided — present the contacts clearly with key details.
+When [HUBSPOT DEALS] is provided — analyze pipeline, amounts, stages.
+The system automatically searches HubSpot when you mention contacts, tasks, or deals. Just answer based on the data provided.
 
 === CREATING A CONTACT ===
 When user says "создай контакт", "добавь контакт", "create contact", "add contact" — IMMEDIATELY output hubspot_create tag.
@@ -668,6 +672,56 @@ def format_tasks_for_claude(tasks):
     return "\n".join(lines)
 
 
+def search_hubspot_contacts(query, limit=20):
+    """Search HubSpot contacts by name, email, phone, or any text."""
+    props = ["firstname", "lastname", "email", "phone", "company", "lifecyclestage",
+             "hs_lead_status", "website", "jobtitle", "notes_last_updated"]
+    data = {"query": query, "properties": props, "limit": limit}
+    result = hubspot_request("POST", "/crm/v3/objects/contacts/search", data)
+    if "error" in result:
+        return None, str(result.get("message", result["error"]))
+    return result.get("results", []), None
+
+
+def search_hubspot_deals(query=None, limit=20):
+    """Search HubSpot deals."""
+    props = ["dealname", "amount", "dealstage", "closedate", "pipeline",
+             "hubspot_owner_id", "createdate"]
+    data = {"properties": props, "limit": limit}
+    if query:
+        data["query"] = query
+    result = hubspot_request("POST", "/crm/v3/objects/deals/search", data)
+    if "error" in result:
+        return None, str(result.get("message", result["error"]))
+    return result.get("results", []), None
+
+
+def format_contacts_for_claude(contacts):
+    if not contacts:
+        return "[HUBSPOT CONTACTS]\nNo contacts found."
+    lines = ["[HUBSPOT CONTACTS]"]
+    for c in contacts:
+        p = c.get("properties", {})
+        name = f"{p.get('firstname', '')} {p.get('lastname', '')}".strip() or "—"
+        line = f"- {name} | email: {p.get('email', '—')} | phone: {p.get('phone', '—')} | company: {p.get('company', '—')}"
+        line += f" | stage: {p.get('lifecyclestage', '—')} | status: {p.get('hs_lead_status', '—')}"
+        if p.get('website'):
+            line += f" | web: {p.get('website')}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def format_deals_for_claude(deals):
+    if not deals:
+        return "[HUBSPOT DEALS]\nNo deals found."
+    lines = ["[HUBSPOT DEALS]"]
+    for d in deals:
+        p = d.get("properties", {})
+        line = f"- {p.get('dealname', '—')} | amount: ${p.get('amount', '—')} | stage: {p.get('dealstage', '—')} | close: {p.get('closedate', '—')[:10] if p.get('closedate') else '—'}"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def create_hubspot_contact(props):
     """Create a new contact in HubSpot. Pops notes_initial and creates note after contact creation."""
     note = props.pop("notes_initial", None)
@@ -849,23 +903,30 @@ async def set_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def find_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.username): return
     if not context.args:
-        await update.message.reply_text("/find username")
+        await update.message.reply_text("/find имя или @username")
         return
-    username = context.args[0].lstrip("@")
-    msg = await update.message.reply_text(f"Ищу {username}...")
-    contacts = search_contact_by_telegram(username)
+    query = " ".join(context.args).lstrip("@")
+    msg = await update.message.reply_text(f"Ищу {query}...")
+
+    # Try telegram username search first, then general search
+    contacts = search_contact_by_telegram(query)
     if not contacts:
-        await msg.edit_text(f"{username} не найден. /debug")
+        contacts, _ = search_hubspot_contacts(query)
+    if not contacts:
+        await msg.edit_text(f"'{query}' не найден в HubSpot.")
         return
-    for c in contacts:
+    await msg.edit_text(f"Найдено: {len(contacts)}")
+    for c in contacts[:10]:
         p = c.get("properties", {})
         name = f"{p.get('firstname', '')} {p.get('lastname', '')}".strip() or "—"
         cid = c["id"]
         link = f"https://app.hubspot.com/contacts/47345195/record/0-1/{cid}"
         stage = LIFECYCLE_STAGES.get(p.get("lifecyclestage", ""), "—")
         status = LEAD_STATUSES.get(p.get("hs_lead_status", ""), "—")
+        company = p.get("company", "")
+        company_str = f"\nCompany: {esc(company)}" if company else ""
         await update.message.reply_text(
-            f"<b>{esc(name)}</b>\nEmail: {esc(p.get('email', '—'))}\nWeb: {esc(p.get('website', '—'))}\n"
+            f"<b>{esc(name)}</b>\nEmail: {esc(p.get('email', '—'))}\nPhone: {esc(p.get('phone', '—'))}{company_str}\n"
             f"Stage: {esc(stage)} | Status: {esc(status)}\n<a href=\"{link}\">HubSpot</a>",
             parse_mode="HTML", disable_web_page_preview=True)
 
@@ -957,10 +1018,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             df, _ = drive_list_recent(10)
             if df: extra += "\n\n" + format_drive_for_claude(df)
     if HUBSPOT_API_KEY:
-        task_kw = ["таск", "задач", "task", "что делать", "что на сегодня", "просроч", "overdue", "to do", "todo", "хабспот"]
+        task_kw = ["таск", "задач", "task", "что делать", "что на сегодня", "просроч", "overdue", "to do", "todo"]
         if any(kw in tl for kw in task_kw):
             tasks, _ = get_hubspot_tasks()
             if tasks: extra += "\n\n" + format_tasks_for_claude(tasks)
+
+        # Contact search: "найди контакт X", "контакты с именем X", "кто такой X в CRM"
+        contact_kw = ["найди контакт", "найди в хабспот", "контакт", "найди в crm", "кто такой", "кто такая",
+                      "find contact", "search contact", "все контакты", "контакты с именем", "hubspot"]
+        if any(kw in tl for kw in contact_kw):
+            # Extract search query — last meaningful word(s) after keyword
+            search_q = user_text.strip()
+            for kw in ["найди контакт", "найди контакты", "найди в хабспот", "найди в crm", "контакты с именем",
+                       "find contact", "search contact", "все контакты с именем", "кто такой", "кто такая"]:
+                if kw in search_q.lower():
+                    idx = search_q.lower().index(kw) + len(kw)
+                    search_q = search_q[idx:].strip()
+                    break
+            if search_q and len(search_q) > 1:
+                contacts, _ = search_hubspot_contacts(search_q)
+                if contacts is not None:
+                    extra += "\n\n" + format_contacts_for_claude(contacts)
+
+        # Deal search
+        deal_kw = ["сделк", "deal", "pipeline", "воронк"]
+        if any(kw in tl for kw in deal_kw):
+            deals, _ = search_hubspot_deals()
+            if deals: extra += "\n\n" + format_deals_for_claude(deals)
 
     url_match = re.search(r'https?://\S+', user_text)
     if url_match:
