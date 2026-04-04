@@ -122,11 +122,12 @@ Text, forwarded messages, files (xlsx, csv, txt), photos/screenshots, calendar, 
 == HUBSPOT ==
 You have FULL direct access to HubSpot via API. The system auto-fetches relevant data when it detects keywords.
 
-=== READING DATA (automatic) ===
-When [HUBSPOT TASKS] is provided — analyze: what's overdue, due today, priorities.
-When [HUBSPOT CONTACTS] is provided — present the contacts clearly with key details.
-When [HUBSPOT DEALS] is provided — analyze pipeline, amounts, stages.
-The system automatically searches HubSpot when you mention contacts, tasks, or deals. Just answer based on the data provided.
+=== READING DATA ===
+The system auto-injects HubSpot data into your context when the user mentions contacts, tasks, or deals.
+- [HUBSPOT TASKS] — analyze: overdue, due today, priorities.
+- [HUBSPOT CONTACTS] — present contacts with all details. NEVER say "I don't have access" or "data not provided" — if contacts are in context, present them. If not in context, the search returned no results — say "не найдено".
+- [HUBSPOT DEALS] — analyze pipeline, amounts, stages.
+IMPORTANT: If HubSpot data sections appear in the message, USE THEM. Never claim you lack access when data is right there.
 
 === CREATING A TASK ===
 When user says "поставь задачу", "создай задачу", "напомни", "task", "follow up" — output:
@@ -1107,20 +1108,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tasks, _ = get_hubspot_tasks()
             if tasks: extra += "\n\n" + format_tasks_for_claude(tasks)
 
-        # Contact search: "найди контакт X", "контакты с именем X", "кто такой X в CRM"
-        contact_kw = ["найди контакт", "найди в хабспот", "контакт", "найди в crm", "кто такой", "кто такая",
-                      "find contact", "search contact", "все контакты", "контакты с именем", "hubspot"]
+        # Contact search: detect ANY search intent with a name
+        # "найди Олега", "все Викторы", "кто такой Иван", "покажи контакт Петров", etc.
+        contact_kw = ["найди", "найти", "поищи", "покажи", "ищи", "search", "find",
+                      "контакт", "клиент", "кто такой", "кто такая", "все ", "всех ",
+                      "hubspot", "хабспот", "crm", "в базе"]
         if any(kw in tl for kw in contact_kw):
-            # Extract search query — last meaningful word(s) after keyword
+            # Extract the actual search query by removing command words
             search_q = user_text.strip()
-            for kw in ["найди контакт", "найди контакты", "найди в хабспот", "найди в crm", "контакты с именем",
-                       "find contact", "search contact", "все контакты с именем", "кто такой", "кто такая"]:
-                if kw in search_q.lower():
-                    idx = search_q.lower().index(kw) + len(kw)
-                    search_q = search_q[idx:].strip()
-                    break
-            if search_q and len(search_q) > 1:
-                contacts, _ = search_hubspot_contacts(search_q)
+            remove_words = ["найди", "найти", "поищи", "покажи", "ищи", "всех", "все", "всю",
+                           "контакт", "контакты", "контактов", "клиент", "клиентов", "клиенты",
+                           "в хабспот", "в хабспоте", "в crm", "в базе", "в hubspot",
+                           "с именем", "по имени", "кто такой", "кто такая",
+                           "find", "search", "show", "get", "мне", "мои"]
+            q = search_q.lower()
+            for w in sorted(remove_words, key=len, reverse=True):
+                q = q.replace(w, " ")
+            q = " ".join(q.split()).strip()
+            # Clean up trailing/leading punctuation
+            q = q.strip("?!.,;: ")
+            if q and len(q) > 1 and not q.isdigit():
+                contacts, _ = search_hubspot_contacts(q)
                 if contacts is not None:
                     extra += "\n\n" + format_contacts_for_claude(contacts)
 
