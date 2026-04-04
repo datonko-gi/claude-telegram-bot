@@ -695,15 +695,84 @@ def format_tasks_for_claude(tasks):
     return "\n".join(lines)
 
 
+CYR_TO_LAT = {"а":"a","б":"b","в":"v","г":"g","д":"d","е":"e","ё":"yo","ж":"zh","з":"z","и":"i","й":"y",
+    "к":"k","л":"l","м":"m","н":"n","о":"o","п":"p","р":"r","с":"s","т":"t","у":"u","ф":"f","х":"kh",
+    "ц":"ts","ч":"ch","ш":"sh","щ":"shch","ъ":"","ы":"y","ь":"","э":"e","ю":"yu","я":"ya",
+    "і":"i","ї":"yi","є":"ye","ґ":"g"}
+
+def transliterate(text):
+    """Transliterate Cyrillic to Latin."""
+    result = []
+    for ch in text.lower():
+        result.append(CYR_TO_LAT.get(ch, ch))
+    return "".join(result).title()
+
+def is_cyrillic(text):
+    return any("\u0400" <= ch <= "\u04ff" for ch in text)
+
 def search_hubspot_contacts(query, limit=20):
-    """Search HubSpot contacts by name, email, phone, or any text."""
+    """Search HubSpot contacts by name, email, phone. Tries both Cyrillic and Latin."""
     props = ["firstname", "lastname", "email", "phone", "company", "lifecyclestage",
              "hs_lead_status", "website", "jobtitle", "notes_last_updated"]
-    data = {"query": query, "properties": props, "limit": limit}
-    result = hubspot_request("POST", "/crm/v3/objects/contacts/search", data)
-    if "error" in result:
-        return None, str(result.get("message", result["error"]))
-    return result.get("results", []), None
+
+    all_results = {}
+
+    # Search with original query
+    for search_term in [query]:
+        data = {"query": search_term.strip(), "properties": props, "limit": limit}
+        result = hubspot_request("POST", "/crm/v3/objects/contacts/search", data)
+        if "results" in result:
+            for c in result["results"]:
+                all_results[c["id"]] = c
+
+    # Also search with CONTAINS_TOKEN on firstname (catches partial matches)
+    for search_term in [query]:
+        data = {
+            "filterGroups": [{"filters": [
+                {"propertyName": "firstname", "operator": "CONTAINS_TOKEN", "value": search_term.strip()}
+            ]}],
+            "properties": props, "limit": limit
+        }
+        result = hubspot_request("POST", "/crm/v3/objects/contacts/search", data)
+        if "results" in result:
+            for c in result["results"]:
+                all_results[c["id"]] = c
+
+    # If Cyrillic query, also try Latin transliteration
+    if is_cyrillic(query):
+        lat = transliterate(query)
+        for search_term in [lat]:
+            data = {"query": search_term, "properties": props, "limit": limit}
+            result = hubspot_request("POST", "/crm/v3/objects/contacts/search", data)
+            if "results" in result:
+                for c in result["results"]:
+                    all_results[c["id"]] = c
+            # CONTAINS_TOKEN too
+            data2 = {
+                "filterGroups": [{"filters": [
+                    {"propertyName": "firstname", "operator": "CONTAINS_TOKEN", "value": search_term.strip()}
+                ]}],
+                "properties": props, "limit": limit
+            }
+            result2 = hubspot_request("POST", "/crm/v3/objects/contacts/search", data2)
+            if "results" in result2:
+                for c in result2["results"]:
+                    all_results[c["id"]] = c
+
+    # Also try lastname
+    for search_term in [query] + ([transliterate(query)] if is_cyrillic(query) else []):
+        data = {
+            "filterGroups": [{"filters": [
+                {"propertyName": "lastname", "operator": "CONTAINS_TOKEN", "value": search_term.strip()}
+            ]}],
+            "properties": props, "limit": limit
+        }
+        result = hubspot_request("POST", "/crm/v3/objects/contacts/search", data)
+        if "results" in result:
+            for c in result["results"]:
+                all_results[c["id"]] = c
+
+    return list(all_results.values()), None
 
 
 def search_hubspot_deals(query=None, limit=20):
