@@ -703,72 +703,22 @@ def format_tasks_for_claude(tasks):
     return "\n".join(lines)
 
 
-CYR_TO_LAT = {"а":"a","б":"b","в":"v","г":"g","д":"d","е":"e","ё":"yo","ж":"zh","з":"z","и":"i","й":"y",
+CYR_TO_LAT = {"а":"a","б":"b","в":"v","г":"g","д":"d","е":"e","ё":"e","ж":"zh","з":"z","и":"i","й":"y",
     "к":"k","л":"l","м":"m","н":"n","о":"o","п":"p","р":"r","с":"s","т":"t","у":"u","ф":"f","х":"kh",
     "ц":"ts","ч":"ch","ш":"sh","щ":"shch","ъ":"","ы":"y","ь":"","э":"e","ю":"yu","я":"ya",
-    "і":"i","ї":"yi","є":"ye","ґ":"g"}
-
-# Common Cyrillic name → known Latin variants (covers Ukrainian transliteration variants)
-NAME_VARIANTS = {
-    "сергей": ["sergey", "serhii", "sergii", "sergei", "sergio"],
-    "сергій": ["serhii", "sergiy", "sergei", "sergey"],
-    "олег": ["oleg", "oleh"],
-    "виктор": ["viktor", "victor"],
-    "віктор": ["viktor", "victor"],
-    "дмитро": ["dmytro", "dmitro", "dmitry"],
-    "дмитрий": ["dmitry", "dmitrii", "dmytro", "dmitri"],
-    "андрей": ["andrey", "andrii", "andriy", "andrei"],
-    "андрій": ["andriy", "andrii", "andrey"],
-    "олександр": ["oleksandr", "alexander", "alexandr"],
-    "александр": ["alexander", "alexandr", "oleksandr"],
-    "михаил": ["mikhail", "mykhailo", "michael"],
-    "артем": ["artem", "artom"],
-    "артём": ["artem", "artyom"],
-    "евгений": ["evgeny", "yevhen", "evgeniy", "eugene"],
-    "євген": ["yevhen", "evgen", "eugene"],
-    "николай": ["nikolay", "mykola", "nikolai"],
-    "микола": ["mykola", "nikolay"],
-    "иван": ["ivan"],
-    "іван": ["ivan"],
-    "павел": ["pavel", "pavlo"],
-    "павло": ["pavlo", "pavel"],
-    "максим": ["maksym", "maxim", "maksim"],
-    "алексей": ["aleksey", "oleksii", "alexey", "alexei"],
-    "олексій": ["oleksii", "aleksey", "alexey"],
-    "владимир": ["vladimir", "volodymyr"],
-    "володимир": ["volodymyr", "vladimir"],
-    "карина": ["karina"],
-    "татьяна": ["tatiana", "tatyana", "tetiana"],
-    "тетяна": ["tetiana", "tatiana"],
-    "наталья": ["natalia", "nataliya", "natasha"],
-    "наталія": ["nataliya", "natalia"],
-    "елена": ["elena", "olena", "helen"],
-    "олена": ["olena", "elena"],
-    "анна": ["anna", "hanna"],
-    "ганна": ["hanna", "anna"],
-    "ирина": ["irina", "iryna"],
-    "ірина": ["iryna", "irina"],
-    "семен": ["semen", "semyon", "simon"],
-}
+    "і":"i","ї":"i","є":"e","ґ":"g"}
 
 def transliterate(text):
-    """Transliterate Cyrillic to Latin."""
+    """Simple 1:1 Cyrillic to Latin. Регина→Regina, Виктор→Viktor."""
     result = []
-    for ch in text.lower():
-        result.append(CYR_TO_LAT.get(ch, ch))
-    return "".join(result).title()
-
-def get_name_variants(name):
-    """Get all possible Latin variants of a Cyrillic name."""
-    name_lower = name.lower().strip()
-    variants = set()
-    # Direct transliteration
-    variants.add(transliterate(name))
-    # Known variants
-    if name_lower in NAME_VARIANTS:
-        for v in NAME_VARIANTS[name_lower]:
-            variants.add(v.title())
-    return list(variants)
+    for ch in text:
+        low = ch.lower()
+        lat = CYR_TO_LAT.get(low, low)
+        if ch.isupper() and lat:
+            result.append(lat[0].upper() + lat[1:])
+        else:
+            result.append(lat)
+    return "".join(result)
 
 def is_cyrillic(text):
     return any("\u0400" <= ch <= "\u04ff" for ch in text)
@@ -801,9 +751,9 @@ def search_hubspot_contacts(query, limit=20):
             for c in result["results"]:
                 all_results[c["id"]] = c
 
-    # If Cyrillic query, try all known Latin variants
+    # If Cyrillic query, try Latin transliteration
     if is_cyrillic(query):
-        variants = get_name_variants(query)
+        variants = [transliterate(query)]
         for variant in variants:
             # query search
             data = {"query": variant, "properties": props, "limit": limit}
@@ -826,7 +776,7 @@ def search_hubspot_contacts(query, limit=20):
     # Also try lastname with all variants
     search_terms = [query]
     if is_cyrillic(query):
-        search_terms.extend(get_name_variants(query))
+        search_terms.append(transliterate(query))
     for search_term in search_terms:
         data = {
             "filterGroups": [{"filters": [
