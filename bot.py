@@ -168,7 +168,7 @@ Before outputting the tag, carefully read ALL messages in the conversation (forw
 - email: any @-containing address in the text (e.g. gagkp@mail.ru, andrkrupenko@gmail.com)
 - phone: any phone number in the text (e.g. 3233287890)
 - website: Telegram link if present (https://t.me/username)
-- job_title: professional role if mentioned
+- jobtitle: professional role if mentioned
 - company: employer if mentioned
 - notes_initial: summary of what the person does / why they are being added
 
@@ -176,13 +176,13 @@ Examples of data to extract:
 - "Forwarded from Иван" → firstname: "Иван"
 - "gagkp@mail.ru" → email: "gagkp@mail.ru"
 - "https://t.me/mariia_valieva" → website: "https://t.me/mariia_valieva"
-- "Filmmaker, Photographer, Designer" → job_title: "Filmmaker, Photographer, Designer"
+- "Filmmaker, Photographer, Designer" → jobtitle: "Filmmaker, Photographer, Designer"
 - "3233287890" → phone: "3233287890"
 
 DO NOT leave fields empty if the data is visible in the conversation. Extract everything available.
 
 Tag format:
-<hubspot_create>{"firstname":"...","lastname":"...","email":"...","phone":"...","job_title":"...","company":"...","lifecyclestage":"lead","hs_lead_status":"NEW","website":"https://t.me/username","notes_initial":"..."}</hubspot_create>
+<hubspot_create>{"firstname":"...","lastname":"...","email":"...","phone":"...","jobtitle":"...","company":"...","lifecyclestage":"lead","hs_lead_status":"NEW","website":"https://t.me/username","notes_initial":"..."}</hubspot_create>
 
 Use only fields you have actual data for. Omit fields with no data.
 NEVER search before creating. Output hubspot_create tag immediately.
@@ -834,6 +834,9 @@ def format_deals_for_claude(deals):
 def create_hubspot_contact(props):
     """Create a new contact in HubSpot. Pops notes_initial and creates note after contact creation."""
     note = props.pop("notes_initial", None)
+    # Remap common field name mismatches
+    if "job_title" in props:
+        props["jobtitle"] = props.pop("job_title")
     result = hubspot_request("POST", "/crm/v3/objects/contacts", {"properties": props})
     if "error" not in result and note:
         cid = result.get("id")
@@ -1342,7 +1345,7 @@ async def _process_message(update, chat_id, content, fwd_username=None):
             name = f"{hs_create.get('firstname', '')} {hs_create.get('lastname', '')}".strip() or "—"
             email_val = hs_create.get("email", "—")
             phone_val = hs_create.get("phone", "")
-            job_val = hs_create.get("job_title", "")
+            job_val = hs_create.get("jobtitle", "") or hs_create.get("job_title", "")
             company_val = hs_create.get("company", "")
             stage = LIFECYCLE_STAGES.get(hs_create.get("lifecyclestage", ""), hs_create.get("lifecyclestage", "—"))
             details = f"Имя: {esc(name)}\nEmail: {esc(email_val)}"
