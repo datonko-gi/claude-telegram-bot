@@ -1337,27 +1337,37 @@ async def _process_message(update, chat_id, content, fwd_username=None):
             tg_match = re.search(r't\.me/(\w+)', website)
             create_username = tg_match.group(1).lower() if tg_match else None
 
-            pending_updates[chat_id] = {
-                "type": "hubspot_create",
-                "data": hs_create,
-                "tg_username": create_username,
-            }
+            # Duplicate check: if contact already in cache, offer update instead of create
             name = f"{hs_create.get('firstname', '')} {hs_create.get('lastname', '')}".strip() or "—"
-            email_val = hs_create.get("email", "—")
-            phone_val = hs_create.get("phone", "")
-            job_val = hs_create.get("jobtitle", "") or hs_create.get("job_title", "")
-            company_val = hs_create.get("company", "")
-            stage = LIFECYCLE_STAGES.get(hs_create.get("lifecyclestage", ""), hs_create.get("lifecyclestage", "—"))
-            details = f"Имя: {esc(name)}\nEmail: {esc(email_val)}"
-            if phone_val: details += f"\nТел: {esc(phone_val)}"
-            if job_val: details += f"\nДолжность: {esc(job_val)}"
-            if company_val: details += f"\nКомпания: {esc(company_val)}"
-            details += f"\nStage: {esc(stage)}"
-            if website: details += f"\nTelegram: {esc(website)}"
-            kb = [[InlineKeyboardButton("✅ Создать", callback_data="hsc_confirm"), InlineKeyboardButton("❌ Отмена", callback_data="hsc_cancel")]]
-            await update.message.reply_text(
-                f"{esc(clean)}\n\n━━━━━━━━━━━━━━━\n<b>Создать контакт в HubSpot:</b>\n{details}",
-                parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+            dup_cid = created_contacts.get(create_username) if create_username else None
+            if not dup_cid and name != "—":
+                dup_cid = created_contacts.get(name.lower())
+            if dup_cid:
+                link = f"https://app.hubspot.com/contacts/47345195/record/0-1/{dup_cid}"
+                await update.message.reply_text(
+                    f"{esc(clean)}\n\n⚠️ Контакт <b>{esc(name)}</b> уже создан в этой сессии.\n<a href=\"{link}\">Открыть в HubSpot</a>",
+                    parse_mode="HTML", disable_web_page_preview=True)
+            else:
+                pending_updates[chat_id] = {
+                    "type": "hubspot_create",
+                    "data": hs_create,
+                    "tg_username": create_username,
+                }
+                email_val = hs_create.get("email", "—")
+                phone_val = hs_create.get("phone", "")
+                job_val = hs_create.get("jobtitle", "") or hs_create.get("job_title", "")
+                company_val = hs_create.get("company", "")
+                stage = LIFECYCLE_STAGES.get(hs_create.get("lifecyclestage", ""), hs_create.get("lifecyclestage", "—"))
+                details = f"Имя: {esc(name)}\nEmail: {esc(email_val)}"
+                if phone_val: details += f"\nТел: {esc(phone_val)}"
+                if job_val: details += f"\nДолжность: {esc(job_val)}"
+                if company_val: details += f"\nКомпания: {esc(company_val)}"
+                details += f"\nStage: {esc(stage)}"
+                if website: details += f"\nTelegram: {esc(website)}"
+                kb = [[InlineKeyboardButton("✅ Создать", callback_data="hsc_confirm"), InlineKeyboardButton("❌ Отмена", callback_data="hsc_cancel")]]
+                await update.message.reply_text(
+                    f"{esc(clean)}\n\n━━━━━━━━━━━━━━━\n<b>Создать контакт в HubSpot:</b>\n{details}",
+                    parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
         elif hs_update and tg_username:
             # If this username is in the local cache (just created), apply update directly without search
@@ -1549,10 +1559,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 link = f"https://app.hubspot.com/contacts/47345195/record/0-1/{cid}"
                 d = pending["data"]
                 name = f"{d.get('firstname', '')} {d.get('lastname', '')}".strip() or "—"
-                # Cache username -> contact id to bypass HubSpot search index delay
+                # Cache by tg username AND by full name to bypass HubSpot search index delay
                 tg_u = pending.get("tg_username")
                 if tg_u:
                     created_contacts[tg_u.lower()] = cid
+                # Also cache by name and email so updates find it despite HubSpot index delay
+                if name and name != "—":
+                    created_contacts[name.lower()] = cid
+                email = d.get("email", "")
+                if email:
+                    created_contacts[email.lower()] = cid
                 await q.edit_message_text(
                     f"✅ Контакт <b>{esc(name)}</b> создан!\n<a href=\"{link}\">Открыть в HubSpot</a>",
                     parse_mode="HTML", disable_web_page_preview=True)
