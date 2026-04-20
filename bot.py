@@ -1248,11 +1248,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cancel_kw = ["отмени задачу", "удали задачу", "список задач", "cancel job", "my jobs"]
     if any(kw in tl for kw in schedule_kw):
         reply = await handle_schedule_command(update, chat_id, user_text)
-        await update.message.reply_text(reply, parse_mode="HTML")
+        await update.message.reply_text(md_to_html(reply), parse_mode="HTML")
         return
     if any(kw in tl for kw in cancel_kw):
         reply = await handle_cancel_schedule(update, chat_id, user_text)
-        await update.message.reply_text(reply, parse_mode="HTML")
+        await update.message.reply_text(md_to_html(reply), parse_mode="HTML")
         return
 
     await _process_message(update, chat_id, user_text + extra, fwd_username=fwd_username)
@@ -1345,7 +1345,7 @@ async def _process_message(update, chat_id, content, fwd_username=None):
             if dup_cid:
                 link = f"https://app.hubspot.com/contacts/47345195/record/0-1/{dup_cid}"
                 await update.message.reply_text(
-                    f"{esc(clean)}\n\n⚠️ Контакт <b>{esc(name)}</b> уже создан в этой сессии.\n<a href=\"{link}\">Открыть в HubSpot</a>",
+                    f"{md_to_html(clean)}\n\n⚠️ Контакт <b>{esc(name)}</b> уже создан в этой сессии.\n<a href=\"{link}\">Открыть в HubSpot</a>",
                     parse_mode="HTML", disable_web_page_preview=True)
             else:
                 pending_updates[chat_id] = {
@@ -1366,7 +1366,7 @@ async def _process_message(update, chat_id, content, fwd_username=None):
                 if website: details += f"\nTelegram: {esc(website)}"
                 kb = [[InlineKeyboardButton("✅ Создать", callback_data="hsc_confirm"), InlineKeyboardButton("❌ Отмена", callback_data="hsc_cancel")]]
                 await update.message.reply_text(
-                    f"{esc(clean)}\n\n━━━━━━━━━━━━━━━\n<b>Создать контакт в HubSpot:</b>\n{details}",
+                    f"{md_to_html(clean)}\n\n━━━━━━━━━━━━━━━\n<b>Создать контакт в HubSpot:</b>\n{details}",
                     parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
         elif hs_update and tg_username:
@@ -1385,7 +1385,7 @@ async def _process_message(update, chat_id, content, fwd_username=None):
                     add_note_to_contact(cid, note)
                 link = f"https://app.hubspot.com/contacts/47345195/record/0-1/{cid}"
                 await update.message.reply_text(
-                    f"{esc(clean)}\n\n✅ Данные добавлены в контакт.\n<a href=\"{link}\">HubSpot</a>",
+                    f"{md_to_html(clean)}\n\n✅ Данные добавлены в контакт.\n<a href=\"{link}\">HubSpot</a>",
                     parse_mode="HTML", disable_web_page_preview=True)
             else:
                 await _send_hubspot_update(update, chat_id, hs_update, tg_username, clean)
@@ -1394,21 +1394,21 @@ async def _process_message(update, chat_id, content, fwd_username=None):
             pending_updates[chat_id] = {"type": "calendar", "data": cal_create}
             kb = [[InlineKeyboardButton("✅ Создать", callback_data="cal_confirm"), InlineKeyboardButton("❌ Отмена", callback_data="cal_cancel")]]
             await update.message.reply_text(
-                f"{esc(clean)}\n\n——————————\n<b>Создать событие:</b>\n"
+                f"{md_to_html(clean)}\n\n——————————\n<b>Создать событие:</b>\n"
                 f"{esc(cal_create.get('summary',''))}\n{esc(cal_create.get('start',''))} — {esc(cal_create.get('end',''))}",
                 parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
         elif email_send:
             pending_updates[chat_id] = {"type": "email", "data": email_send}
             kb = [[InlineKeyboardButton("✅ Отправить", callback_data="email_confirm"), InlineKeyboardButton("❌ Отмена", callback_data="email_cancel")]]
             await update.message.reply_text(
-                f"{esc(clean)}\n\n——————————\n<b>Письмо:</b>\nTo: {esc(email_send.get('to',''))}\n"
+                f"{md_to_html(clean)}\n\n——————————\n<b>Письмо:</b>\nTo: {esc(email_send.get('to',''))}\n"
                 f"Subject: {esc(email_send.get('subject',''))}\n{esc(email_send.get('body','')[:200])}...",
                 parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
         elif email_draft:
             pending_updates[chat_id] = {"type": "draft", "data": email_draft}
             kb = [[InlineKeyboardButton("💾 Сохранить черновик", callback_data="draft_confirm"), InlineKeyboardButton("❌ Отмена", callback_data="draft_cancel")]]
             await update.message.reply_text(
-                f"{esc(clean)}\n\n——————————\n<b>Черновик:</b>\nTo: {esc(email_draft.get('to','(не указан)'))}\n"
+                f"{md_to_html(clean)}\n\n——————————\n<b>Черновик:</b>\nTo: {esc(email_draft.get('to','(не указан)'))}\n"
                 f"Subject: {esc(email_draft.get('subject',''))}\n{esc(email_draft.get('body','')[:200])}...",
                 parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
         elif hs_task:
@@ -1423,11 +1423,11 @@ async def _process_message(update, chat_id, content, fwd_username=None):
             if "error" not in result:
                 tid = result.get("id", "?")
                 await update.message.reply_text(
-                    f"{esc(clean)}\n\n✅ Задача создана в HubSpot (ID: {tid})",
+                    f"{md_to_html(clean)}\n\n✅ Задача создана в HubSpot (ID: {tid})",
                     parse_mode="HTML")
             else:
                 await update.message.reply_text(
-                    f"{esc(clean)}\n\n❌ Ошибка: {esc(str(result.get('message', result.get('error', '?')))[:200])}",
+                    f"{md_to_html(clean)}\n\n❌ Ошибка: {esc(str(result.get('message', result.get('error', '?')))[:200])}",
                     parse_mode="HTML")
 
         elif hs_edit:
@@ -1442,11 +1442,11 @@ async def _process_message(update, chat_id, content, fwd_username=None):
                     link = f"https://app.hubspot.com/contacts/47345195/record/0-1/{cid}"
                     fields = ", ".join(f"{k}={v}" for k, v in updates.items())
                     await update.message.reply_text(
-                        f"{esc(clean)}\n\n✅ Обновлён <b>{esc(name)}</b>: {esc(fields)}\n<a href=\"{link}\">HubSpot</a>",
+                        f"{md_to_html(clean)}\n\n✅ Обновлён <b>{esc(name)}</b>: {esc(fields)}\n<a href=\"{link}\">HubSpot</a>",
                         parse_mode="HTML", disable_web_page_preview=True)
                 else:
                     await update.message.reply_text(
-                        f"{esc(clean)}\n\n❌ {esc(str(result.get('error', '?'))[:200])}",
+                        f"{md_to_html(clean)}\n\n❌ {esc(str(result.get('error', '?'))[:200])}",
                         parse_mode="HTML")
             else:
                 await _send_reply(update, clean)
@@ -1461,19 +1461,19 @@ async def _process_message(update, chat_id, content, fwd_username=None):
             if "error" not in result:
                 did = result.get("id", "?")
                 await update.message.reply_text(
-                    f"{esc(clean)}\n\n✅ Сделка создана (ID: {did})",
+                    f"{md_to_html(clean)}\n\n✅ Сделка создана (ID: {did})",
                     parse_mode="HTML")
             else:
                 await update.message.reply_text(
-                    f"{esc(clean)}\n\n❌ Ошибка: {esc(str(result.get('message', '?'))[:200])}",
+                    f"{md_to_html(clean)}\n\n❌ Ошибка: {esc(str(result.get('message', '?'))[:200])}",
                     parse_mode="HTML")
 
         elif hs_complete:
             result = complete_hubspot_task(hs_complete.strip())
             if "error" not in result:
-                await update.message.reply_text(f"{esc(clean)}\n\n✅ Задача закрыта.", parse_mode="HTML")
+                await update.message.reply_text(f"{md_to_html(clean)}\n\n✅ Задача закрыта.", parse_mode="HTML")
             else:
-                await update.message.reply_text(f"{esc(clean)}\n\n❌ Ошибка: {esc(str(result)[:200])}", parse_mode="HTML")
+                await update.message.reply_text(f"{md_to_html(clean)}\n\n❌ Ошибка: {esc(str(result)[:200])}", parse_mode="HTML")
 
         else:
             await _send_reply(update, clean)
@@ -1489,12 +1489,87 @@ async def _process_message(update, chat_id, content, fwd_username=None):
         await update.message.reply_text(f"❌ Ошибка: {esc(str(e)[:200])}")
 
 
+_MD_FENCE_RE = re.compile(r"```(\w*)\n?(.*?)```", re.DOTALL)
+_MD_INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)\s]+)\)")
+_MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
+_MD_ITALIC_STAR_RE = re.compile(r"(?<![\*\w])\*(?!\s)([^*\n]+?)(?<!\s)\*(?![\*\w])")
+_MD_ITALIC_UND_RE = re.compile(r"(?<!\w)_(?!\s)([^_\n]+?)(?<!\s)_(?!\w)")
+_MD_HEADER_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
+_MD_HR_RE = re.compile(r"^[ \t]*(-{3,}|\*{3,})[ \t]*$", re.MULTILINE)
+_MD_BULLET_RE = re.compile(r"^(\s*)[-*]\s+", re.MULTILINE)
+
+
 def md_to_html(text):
-    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
-    text = re.sub(r'\*(.+?)\*', r'<i>\1</i>', text)
-    text = re.sub(r'`(.+?)`', r'<code>\1</code>', text)
-    text = re.sub(r'^#{1,3}\s+(.+)$', r'<b>\1</b>', text, flags=re.MULTILINE)
-    text = re.sub(r'^\s*-{3,}\s*$', '——————————', text, flags=re.MULTILINE)
+    """Convert Claude's GitHub-flavored Markdown to Telegram-safe HTML.
+
+    Handles: fenced code blocks, inline code, links, bold, italic, headers,
+    horizontal rules, bullet lists. HTML-escapes <, >, & in non-tag text.
+    """
+    if not text:
+        return ""
+
+    fences = []
+
+    def _fence_sub(m):
+        idx = len(fences)
+        fences.append((m.group(1) or "", m.group(2) or ""))
+        return f"\x00F{idx}\x00"
+    text = _MD_FENCE_RE.sub(_fence_sub, text)
+
+    inlines = []
+
+    def _inline_sub(m):
+        idx = len(inlines)
+        inlines.append(m.group(1))
+        return f"\x00I{idx}\x00"
+    text = _MD_INLINE_CODE_RE.sub(_inline_sub, text)
+
+    links = []
+
+    def _link_sub(m):
+        idx = len(links)
+        links.append((m.group(1), m.group(2)))
+        return f"\x00L{idx}\x00"
+    text = _MD_LINK_RE.sub(_link_sub, text)
+
+    # Escape HTML specials in remaining text
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    # Headers → bold on own line
+    text = _MD_HEADER_RE.sub(lambda m: f"<b>{m.group(2).strip()}</b>", text)
+
+    # Horizontal rule
+    text = _MD_HR_RE.sub("─────────────", text)
+
+    # Bold before italic
+    text = _MD_BOLD_RE.sub(r"<b>\1</b>", text)
+    text = _MD_ITALIC_STAR_RE.sub(r"<i>\1</i>", text)
+    text = _MD_ITALIC_UND_RE.sub(r"<i>\1</i>", text)
+
+    # Bullets
+    text = _MD_BULLET_RE.sub(r"\1• ", text)
+
+    # Restore inline code
+    for i, code in enumerate(inlines):
+        safe = code.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        text = text.replace(f"\x00I{i}\x00", f"<code>{safe}</code>")
+
+    # Restore links
+    for i, (label, url) in enumerate(links):
+        safe_label = label.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        safe_url = url.replace("&", "&amp;").replace('"', "&quot;")
+        text = text.replace(f"\x00L{i}\x00", f'<a href="{safe_url}">{safe_label}</a>')
+
+    # Restore fenced code blocks
+    for i, (lang, code) in enumerate(fences):
+        safe_code = code.rstrip("\n").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        if lang:
+            repl = f'<pre><code class="language-{lang}">{safe_code}</code></pre>'
+        else:
+            repl = f"<pre>{safe_code}</pre>"
+        text = text.replace(f"\x00F{i}\x00", repl)
+
     return text.strip()
 
 
@@ -1528,14 +1603,14 @@ async def _send_hubspot_update(update, chat_id, hs_update, tg_username, clean):
         kb = [[InlineKeyboardButton("✅ Всё", callback_data="hs_confirm"), InlineKeyboardButton("❌", callback_data="hs_cancel")],
               [InlineKeyboardButton("📝 Заметку", callback_data="hs_note_only"), InlineKeyboardButton("📊 Статус", callback_data="hs_status_only")]]
         await update.message.reply_text(
-            f"{esc(clean)}\n\n━━━━━━━━━━━━━━━\n<b>HubSpot: {esc(name)}</b>\n\n"
+            f"{md_to_html(clean)}\n\n━━━━━━━━━━━━━━━\n<b>HubSpot: {esc(name)}</b>\n\n"
             f"Stage: {esc(cs)} → <b>{esc(ns)}</b>\nStatus: {esc(cst)} → <b>{esc(nst)}</b>\n"
             f"Заметка: {esc(hs_update.get('suggested_note', '—'))}\n\n<b>Нажми кнопку:</b>",
             parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
     else:
         # No search spam — just inform and suggest creating
         await update.message.reply_text(
-            f"{esc(clean)}\n\nКонтакт <b>{esc(tg_username)}</b> не найден в HubSpot.\n"
+            f"{md_to_html(clean)}\n\nКонтакт <b>{esc(tg_username)}</b> не найден в HubSpot.\n"
             f"Напиши <b>создай контакт</b> чтобы добавить.",
             parse_mode="HTML")
 
