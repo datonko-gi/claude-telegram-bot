@@ -39,6 +39,51 @@ scheduled_jobs: dict[int, list] = defaultdict(list)
 scheduler = AsyncIOScheduler()
 _google_token_cache = {"token": "", "expires": 0}
 
+# Per-chat asyncio lock so a second message arriving mid-process gets
+# acknowledged immediately and queued instead of vanishing into the PTB queue.
+_CHAT_LOCKS: dict[int, asyncio.Lock] = {}
+
+
+def _chat_lock(chat_id: int) -> asyncio.Lock:
+    lock = _CHAT_LOCKS.get(chat_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _CHAT_LOCKS[chat_id] = lock
+    return lock
+
+
+async def _ack_if_locked(msg, chat_id: int) -> None:
+    if _chat_lock(chat_id).locked():
+        try:
+            await msg.reply_text("⏳ Доделаю предыдущее, потом возьмусь за это.")
+        except Exception:
+            pass
+
+
+# Lazy faster-whisper model (CPU int8). Default size "small"; override on
+# small Railway instances with WHISPER_MODEL_SIZE=tiny|base|small.
+_whisper_model = None
+_WHISPER_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "small")
+
+
+def _get_whisper():
+    global _whisper_model
+    if _whisper_model is None:
+        from faster_whisper import WhisperModel
+        logger.info(f"Loading Whisper model ({_WHISPER_SIZE}, int8 CPU)...")
+        _whisper_model = WhisperModel(
+            _WHISPER_SIZE, device="cpu", compute_type="int8", cpu_threads=4
+        )
+        logger.info("Whisper model loaded.")
+    return _whisper_model
+
+
+def _transcribe_sync(file_path: str) -> tuple[str, str]:
+    model = _get_whisper()
+    segments, info = model.transcribe(file_path, beam_size=5, vad_filter=True)
+    text = " ".join(seg.text.strip() for seg in segments).strip()
+    return text, info.language
+
 # Cache: telegram username (lowercase, no @) -> HubSpot contact id
 # Populated after successful contact creation to avoid search index delay
 created_contacts: dict[str, str] = {}
@@ -1110,19 +1155,21 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     caption = update.message.caption or "Что на этом изображении?"
     photo = update.message.photo[-1]
-    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-    try:
-        tg_file = await photo.get_file()
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-            await tg_file.download_to_drive(tmp.name)
-            tmp_path = tmp.name
-        with open(tmp_path, "rb") as f:
-            img = base64.standard_b64encode(f.read()).decode("utf-8")
-        os.unlink(tmp_path)
-        content = [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img}}, {"type": "text", "text": caption}]
-        await _process_message(update, chat_id, content)
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка: {e}")
+    await _ack_if_locked(update.message, chat_id)
+    async with _chat_lock(chat_id):
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        try:
+            tg_file = await photo.get_file()
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                await tg_file.download_to_drive(tmp.name)
+                tmp_path = tmp.name
+            with open(tmp_path, "rb") as f:
+                img = base64.standard_b64encode(f.read()).decode("utf-8")
+            os.unlink(tmp_path)
+            content = [{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img}}, {"type": "text", "text": caption}]
+            await _process_message(update, chat_id, content)
+        except Exception as e:
+            await update.message.reply_text(f"Ошибка: {e}")
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1136,26 +1183,74 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if (doc.file_size or 0) > 10 * 1024 * 1024:
         await update.message.reply_text("Файл > 10MB.")
         return
-    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-    try:
-        tg_file = await doc.get_file()
-        with tempfile.NamedTemporaryFile(suffix=f"_{fn}", delete=False) as tmp:
-            await tg_file.download_to_drive(tmp.name)
-            tmp_path = tmp.name
-        is_img = mt.startswith("image/") or fn.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))
-        if is_img:
-            with open(tmp_path, "rb") as f:
-                img = base64.standard_b64encode(f.read()).decode("utf-8")
-            os.unlink(tmp_path)
-            imt = "image/png" if fn.lower().endswith(".png") else "image/jpeg"
-            content = [{"type": "image", "source": {"type": "base64", "media_type": imt, "data": img}}, {"type": "text", "text": cap or fn}]
-        else:
-            fc = parse_file(tmp_path, fn)
-            os.unlink(tmp_path)
-            content = f"[FILE: {fn}]\n{fc}" + (f"\n\n{cap}" if cap else "")
-        await _process_message(update, chat_id, content)
-    except Exception as e:
-        await update.message.reply_text(f"Ошибка: {e}")
+    await _ack_if_locked(update.message, chat_id)
+    async with _chat_lock(chat_id):
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        try:
+            tg_file = await doc.get_file()
+            with tempfile.NamedTemporaryFile(suffix=f"_{fn}", delete=False) as tmp:
+                await tg_file.download_to_drive(tmp.name)
+                tmp_path = tmp.name
+            is_img = mt.startswith("image/") or fn.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))
+            if is_img:
+                with open(tmp_path, "rb") as f:
+                    img = base64.standard_b64encode(f.read()).decode("utf-8")
+                os.unlink(tmp_path)
+                imt = "image/png" if fn.lower().endswith(".png") else "image/jpeg"
+                content = [{"type": "image", "source": {"type": "base64", "media_type": imt, "data": img}}, {"type": "text", "text": cap or fn}]
+            else:
+                fc = parse_file(tmp_path, fn)
+                os.unlink(tmp_path)
+                content = f"[FILE: {fn}]\n{fc}" + (f"\n\n{cap}" if cap else "")
+            await _process_message(update, chat_id, content)
+        except Exception as e:
+            await update.message.reply_text(f"Ошибка: {e}")
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.username): return
+    chat_id = update.effective_chat.id
+    audio = update.message.voice or update.message.audio
+    if not audio: return
+
+    logger.info(
+        f"Voice message: chat_id={chat_id} duration={audio.duration}s "
+        f"size={audio.file_size}B"
+    )
+
+    await _ack_if_locked(update.message, chat_id)
+    async with _chat_lock(chat_id):
+        try:
+            tg_file = await audio.get_file()
+            with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+                tmp_path = tmp.name
+            await tg_file.download_to_drive(tmp_path)
+        except Exception as e:
+            await update.message.reply_text(f"Не смог скачать голосовое: {e}")
+            return
+
+        placeholder = await update.message.reply_text("🎙 транскрибирую…")
+        try:
+            text, lang = await asyncio.to_thread(_transcribe_sync, tmp_path)
+        except Exception as e:
+            try: await placeholder.edit_text(f"❌ transcription failed: {e}")
+            except Exception: pass
+            return
+        finally:
+            try: os.unlink(tmp_path)
+            except Exception: pass
+
+        if not text:
+            try: await placeholder.edit_text("❌ пустая транскрипция")
+            except Exception: pass
+            return
+
+        try: await placeholder.edit_text(f"🎙 [{lang}] {text}")
+        except Exception: pass
+
+        # Run the transcribed text through the same intent-detection +
+        # processing path as a typed message would. We're already in the lock.
+        await _handle_text_inner(update, chat_id, text)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1176,6 +1271,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 user_text = f"[FORWARDED from {fwd_name}]\n{user_text}"
     except: pass
 
+    await _ack_if_locked(update.message, chat_id)
+    async with _chat_lock(chat_id):
+        await _handle_text_inner(update, chat_id, user_text, fwd_username)
+
+
+async def _handle_text_inner(update, chat_id, user_text, fwd_username=None):
     extra = ""
     tl = user_text.lower()
     if GOOGLE_REFRESH_TOKEN:
@@ -1774,7 +1875,12 @@ async def handle_cancel_schedule(update, chat_id, user_text):
 
 
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .concurrent_updates(True)
+        .build()
+    )
     for cmd, fn in [("start", start), ("reset", reset), ("debug", debug_cmd), ("cal", calendar_cmd),
                     ("mail", mail_cmd), ("drive", drive_cmd), ("tasks", tasks_cmd), ("model", model_info), ("setmodel", set_model), ("find", find_contact)]:
         app.add_handler(CommandHandler(cmd, fn))
@@ -1782,6 +1888,7 @@ def main():
         app.add_handler(CommandHandler(f"cal{i}", calendar_cmd))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info(f"Bot started. Model: {MODEL} | Google: {'YES' if GOOGLE_REFRESH_TOKEN else 'NO'} | HubSpot: {'YES' if HUBSPOT_API_KEY else 'NO'}")
