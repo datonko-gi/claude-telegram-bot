@@ -33,7 +33,10 @@ GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
 
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
-conversations: dict[int, list] = defaultdict(list)
+# Conversation history persists in SQLite on the Railway volume at /data so
+# git push / redeploys don't wipe context. See db.py.
+import db as _convdb  # noqa: E402
+_convdb.init_db()
 pending_updates: dict[int, dict] = {}
 scheduled_jobs: dict[int, list] = defaultdict(list)
 scheduler = AsyncIOScheduler()
@@ -58,6 +61,50 @@ async def _ack_if_locked(msg, chat_id: int) -> None:
             await msg.reply_text("⏳ Доделаю предыдущее, потом возьмусь за это.")
         except Exception:
             pass
+
+
+# Claude can ask the bot to attach a file to its reply by ending its response
+# with one or more [ATTACH: /full/path/to/file] markers. On Railway the
+# container fs is ephemeral, so /tmp is the canonical save location.
+ATTACH_RE = re.compile(r"\[ATTACH:\s*([^\]\n]+?)\s*\]")
+ATTACH_MAX_BYTES = 50 * 1024 * 1024
+
+
+def _extract_attachments(text):
+    paths = [m.group(1).strip() for m in ATTACH_RE.finditer(text or "")]
+    cleaned = ATTACH_RE.sub("", text or "").strip()
+    return cleaned, paths
+
+
+async def _send_attachments(reply_target, paths):
+    import os as _os
+    for raw in paths:
+        try:
+            if not _os.path.isfile(raw):
+                try:
+                    await reply_target.reply_text(
+                        f"⚠️ ATTACH file not found: {raw}"
+                    )
+                except Exception:
+                    pass
+                continue
+            sz = _os.path.getsize(raw)
+            if sz > ATTACH_MAX_BYTES:
+                try:
+                    await reply_target.reply_text(
+                        f"⚠️ ATTACH too large for Telegram: {_os.path.basename(raw)} "
+                        f"({sz // 1024 // 1024} MB > 50 MB)"
+                    )
+                except Exception:
+                    pass
+                continue
+            with open(raw, "rb") as fh:
+                await reply_target.reply_document(fh, filename=_os.path.basename(raw))
+        except Exception as exc:
+            try:
+                await reply_target.reply_text(f"⚠️ ATTACH failed for {raw}: {exc}")
+            except Exception:
+                pass
 
 
 # Lazy faster-whisper model (CPU int8). Default size "small"; override on
@@ -260,6 +307,15 @@ Daniel must confirm before sending. For drafts, "to" can be empty string if addr
 
 == GOOGLE DRIVE ==
 When [DRIVE DATA] is provided, analyze the files/content. You can see file names, types, and content when provided.
+
+== SENDING FILES BACK (Telegram attachments) ==
+If you generate a file Daniel should receive (xlsx export, csv, rendered PDF, image, etc.), save it to /tmp/ on this Railway container and end your reply with one or more `[ATTACH: <full_path>]` markers (one per file). The bot strips the markers from the visible text and sends each file as a Telegram document. Files must be < 50 MB. Multiple [ATTACH:] markers are allowed.
+
+Example after generating an export:
+Готово, выгрузка контактов из HubSpot за апрель.
+[ATTACH: /tmp/hubspot_contacts_2026-04.csv]
+
+The Railway filesystem is ephemeral so /tmp/ is the only safe location. Do NOT inline file content in the reply text. Do NOT use this marker for content that fits in a chat message (just paste it).
 """
 
 
@@ -968,6 +1024,10 @@ def clean_response(text):
     for tag in ["hubspot_update", "hubspot_contact", "hubspot_create", "hubspot_search", "hubspot_task",
                 "hubspot_edit", "hubspot_deal", "hubspot_complete_task", "calendar_create", "gmail_send", "gmail_draft"]:
         text = re.sub(rf"<{tag}>.*?</{tag}>", "", text, flags=re.DOTALL)
+    # Also strip [ATTACH:] markers from text shown to user; the bot will send
+    # the actual file separately via reply_document. _extract_attachments()
+    # in _process_message captures the paths before clean_response is called.
+    text = ATTACH_RE.sub("", text)
     return text.strip()
 
 
@@ -999,7 +1059,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.username): return
-    conversations[update.effective_chat.id] = []
+    _convdb.db_clear(update.effective_chat.id)
     pending_updates.pop(update.effective_chat.id, None)
     await update.message.reply_text("История очищена.")
 
@@ -1207,6 +1267,84 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Ошибка: {e}")
 
 
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.username): return
+    chat_id = update.effective_chat.id
+    media = update.message.video or update.message.video_note
+    if not media: return
+
+    logger.info(
+        f"Video message: chat_id={chat_id} duration={media.duration}s "
+        f"size={media.file_size}B kind={'video_note' if update.message.video_note else 'video'}"
+    )
+
+    await _ack_if_locked(update.message, chat_id)
+    async with _chat_lock(chat_id):
+        try:
+            tg_file = await media.get_file()
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as v:
+                vid_path = v.name
+            await tg_file.download_to_drive(vid_path)
+        except Exception as e:
+            await update.message.reply_text(f"Не смог скачать видео: {e}")
+            return
+
+        wav_path = vid_path + ".wav"
+        placeholder = await update.message.reply_text("\U0001F39E извлекаю аудио и транскрибирую...")
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y", "-i", vid_path,
+                "-vn", "-ac", "1", "-ar", "16000", "-f", "wav", wav_path,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                err = (stderr or b"").decode("utf-8", "replace")[-300:]
+                try: await placeholder.edit_text(f"ffmpeg failed: {err}")
+                except Exception: pass
+                return
+        except FileNotFoundError:
+            try: await placeholder.edit_text("ffmpeg not available in this build.")
+            except Exception: pass
+            return
+        finally:
+            try: os.unlink(vid_path)
+            except Exception: pass
+
+        try:
+            text, lang = await asyncio.to_thread(_transcribe_sync, wav_path)
+        except Exception as e:
+            try: await placeholder.edit_text(f"❌ transcription failed: {e}")
+            except Exception: pass
+            return
+        finally:
+            try: os.unlink(wav_path)
+            except Exception: pass
+
+        caption = (update.message.caption or "").strip()
+        if not text and not caption:
+            try: await placeholder.edit_text("\U0001F39E пустая транскрипция (немое видео без подписи)")
+            except Exception: pass
+            return
+
+        body_parts = []
+        if text:
+            body_parts.append(f"[VIDEO TRANSCRIPT, lang={lang}]\n{text}")
+        if caption:
+            body_parts.append(f"Caption: {caption}")
+        combined = "\n\n".join(body_parts)
+
+        try:
+            short_t = text[:200] + ("..." if len(text) > 200 else "") if text else "(no speech)"
+            await placeholder.edit_text(f"\U0001F39E [{lang or '?'}] {short_t}")
+        except Exception:
+            pass
+
+        await _handle_text_inner(update, chat_id, combined)
+
+
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.username): return
     chat_id = update.effective_chat.id
@@ -1366,9 +1504,9 @@ async def _keep_typing(bot, chat_id, stop_event):
 
 
 async def _process_message(update, chat_id, content, fwd_username=None):
-    conversations[chat_id].append({"role": "user", "content": content})
-    if len(conversations[chat_id]) > MAX_HISTORY:
-        conversations[chat_id] = conversations[chat_id][-MAX_HISTORY:]
+    _convdb.db_append(chat_id, "user", content)
+    _convdb.db_truncate(chat_id, MAX_HISTORY)
+    history = _convdb.db_load(chat_id)
     stop_typing = asyncio.Event()
     typing_task = asyncio.create_task(
         _keep_typing(update.get_bot(), chat_id, stop_typing)
@@ -1381,7 +1519,7 @@ async def _process_message(update, chat_id, content, fwd_username=None):
                     model=MODEL,
                     max_tokens=4096,
                     system=SYSTEM_PROMPT,
-                    messages=conversations[chat_id],
+                    messages=history,
                     tools=[{"type": "web_search_20250305", "name": "web_search"}]
                 )
             ),
@@ -1393,31 +1531,32 @@ async def _process_message(update, chat_id, content, fwd_username=None):
             block.text for block in response.content
             if hasattr(block, "text")
         )
-        conversations[chat_id].append({"role": "assistant", "content": reply})
+        _convdb.db_append(chat_id, "assistant", reply)
 
         # Check if Claude wants to search HubSpot first (two-phase: search → act)
         hs_search_q = extract_tag_text(reply, "hubspot_search")
         if hs_search_q:
             contacts, _ = search_hubspot_contacts(hs_search_q.strip())
             search_data = format_contacts_for_claude(contacts) if contacts else "[HUBSPOT CONTACTS]\nNo contacts found for '" + hs_search_q + "'."
-            # Don't show intermediate reply to user — feed results back to Claude silently
-            conversations[chat_id][-1] = {"role": "assistant", "content": clean_response(reply) or "Searching..."}
+            # Don't show intermediate reply to user — replace last assistant turn
+            _convdb.db_replace_last(chat_id, "assistant", clean_response(reply) or "Searching...")
             follow_up = f"[SEARCH RESULTS for '{hs_search_q}']\n{search_data}\n\nNow complete the user's original request using the contact_id from results above. Do NOT output another hubspot_search tag."
             if contacts:
                 c = contacts[0]
                 follow_up += f"\nFirst match: ID={c['id']}, {c['properties'].get('firstname','')} {c['properties'].get('lastname','')}"
-            conversations[chat_id].append({"role": "user", "content": follow_up})
+            _convdb.db_append(chat_id, "user", follow_up)
+            history = _convdb.db_load(chat_id)
             response2 = await asyncio.wait_for(
                 asyncio.get_event_loop().run_in_executor(
                     None,
                     lambda: client.messages.create(
                         model=MODEL, max_tokens=4096, system=SYSTEM_PROMPT,
-                        messages=conversations[chat_id],
+                        messages=history,
                     )
                 ), timeout=60
             )
             reply = "\n".join(block.text for block in response2.content if hasattr(block, "text"))
-            conversations[chat_id].append({"role": "assistant", "content": reply})
+            _convdb.db_append(chat_id, "assistant", reply)
 
         hs_create = extract_tag_json(reply, "hubspot_create")
         hs_update = extract_tag_json(reply, "hubspot_update")
@@ -1430,6 +1569,8 @@ async def _process_message(update, chat_id, content, fwd_username=None):
         cal_create = extract_tag_json(reply, "calendar_create")
         email_send = extract_tag_json(reply, "gmail_send")
         email_draft = extract_tag_json(reply, "gmail_draft")
+        # Capture [ATTACH:] paths before clean_response strips them from text
+        _attach_paths = [m.group(1).strip() for m in ATTACH_RE.finditer(reply or "")]
         clean = clean_response(reply)
 
         if hs_create:
@@ -1578,6 +1719,10 @@ async def _process_message(update, chat_id, content, fwd_username=None):
 
         else:
             await _send_reply(update, clean)
+
+        # After whatever branch ran, push any [ATTACH:] files Claude requested
+        if _attach_paths:
+            await _send_attachments(update.message, _attach_paths)
     except asyncio.TimeoutError:
         stop_typing.set()
         await typing_task
@@ -1889,6 +2034,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
+    app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE, handle_video))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info(f"Bot started. Model: {MODEL} | Google: {'YES' if GOOGLE_REFRESH_TOKEN else 'NO'} | HubSpot: {'YES' if HUBSPOT_API_KEY else 'NO'}")
