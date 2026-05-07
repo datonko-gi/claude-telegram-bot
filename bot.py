@@ -316,6 +316,37 @@ Example after generating an export:
 [ATTACH: /tmp/hubspot_contacts_2026-04.csv]
 
 The Railway filesystem is ephemeral so /tmp/ is the only safe location. Do NOT inline file content in the reply text. Do NOT use this marker for content that fits in a chat message (just paste it).
+
+== TONE & EMOJI ==
+Add **1-2 contextual emojis per response** to feel warm and human, not robotic. Match the emoji to action:
+- ✅ task created / contact added / deal updated
+- 🔍 searching / looking up
+- 📅 calendar / scheduling
+- 💼 deals / pipeline / business
+- 📧 email / Gmail
+- 📂 files / Drive
+- 👤 contact found
+- ⚠️ warning, conflict, missing data
+- 🚨 urgent / critical
+- 💰 money / revenue / payment
+- 🎯 goal / next-step / focus
+- 👋 greetings / closing
+- 🙌 acknowledgement / thanks
+- 🤔 unclear / asking for clarification
+
+Rules:
+- Place emojis at the start of bullet points or natural pause points, not in every sentence.
+- Never replace meaning with emoji-only content.
+- Skip emojis in pure data dumps (e.g. raw HubSpot search results, CSV outputs, error tracebacks).
+- For Russian replies use Russian phrasing + same emoji conventions.
+- Don't overdo it. 1-2 per message is the sweet spot.
+
+== NAME SEARCH ACROSS LANGUAGES ==
+When searching for contacts, ALWAYS try multiple name spellings:
+- Russian-style ↔ Ukrainian-style: Sergey↔Serhii, Alexey↔Oleksii, Vladimir↔Volodymyr, Andrey↔Andrii, Mikhail↔Mykhailo, Ekaterina↔Kateryna, Elena↔Olena, Olga↔Olha, Tatiana↔Tetiana, Natalia↔Nataliia, Anna↔Hanna, Pavel↔Pavlo, Petr↔Petro, Nikolay↔Mykola, Dmitry↔Dmytro, Konstantin↔Kostiantyn, Yevgeny↔Yevhen, Vladislav↔Vladyslav.
+- Cyrillic and Latin transliteration both work — the search system tries them automatically, but if first search returns nothing for a Russian name, suggest Daniel try the Ukrainian variant explicitly (or vice versa).
+- For multi-word names, the system also does **lastname-only search** as fallback. So "Сергей Шепеленко" will find "Serhii Shepelenko" via lastname match.
+- Read both Cyrillic and Latin without translation: e.g. "найди Sergey Petrov" and "найди Сергей Петров" should produce the same search.
 """
 
 
@@ -809,6 +840,59 @@ CYR_TO_LAT = {"а":"a","б":"b","в":"v","г":"g","д":"d","е":"e","ё":"e","ж
     "ц":"ts","ч":"ch","ш":"sh","щ":"shch","ъ":"","ы":"y","ь":"","э":"e","ю":"yu","я":"ya",
     "і":"i","ї":"i","є":"e","ґ":"g"}
 
+# Common Russian-name Ukrainian-style spellings used in HubSpot when contact self-identifies as Ukrainian.
+# Maps lowercase Russian-style transliteration -> Ukrainian-style alternative(s).
+NAME_VARIANTS_RU_TO_UA = {
+    "sergey": ["serhii", "sergii", "sergei"],
+    "sergei": ["serhii", "sergii", "sergey"],
+    "sergii": ["serhii", "sergey", "sergei"],
+    "alexey": ["oleksii", "oleksiy", "alexei"],
+    "alexei": ["oleksii", "oleksiy", "alexey"],
+    "alexander": ["oleksandr", "oleksander"],
+    "alex": ["oleks", "oleksandr"],
+    "andrey": ["andrii", "andriy", "andrei"],
+    "andrei": ["andrii", "andriy", "andrey"],
+    "michael": ["mykhailo", "mihail", "mikhail"],
+    "mikhail": ["mykhailo", "michael"],
+    "ivan": ["ivan"],
+    "yuri": ["yurii", "yuriy", "iurii"],
+    "yury": ["yurii", "yuriy"],
+    "vladimir": ["volodymyr"],
+    "viktor": ["viktor"],
+    "victor": ["viktor"],
+    "dmitry": ["dmytro", "dmitri"],
+    "dmitri": ["dmytro", "dmitry"],
+    "nikolay": ["mykola", "nikolai"],
+    "nikolai": ["mykola", "nikolay"],
+    "nick": ["mykola"],
+    "pavel": ["pavlo"],
+    "petr": ["petro"],
+    "peter": ["petro"],
+    "ekaterina": ["kateryna", "katerina"],
+    "kate": ["kateryna"],
+    "elena": ["olena", "helena"],
+    "helen": ["olena"],
+    "olga": ["olha"],
+    "tatiana": ["tetiana", "tatyana"],
+    "tatyana": ["tetiana", "tatiana"],
+    "natalia": ["nataliia", "nataliya", "natalya"],
+    "natalya": ["nataliia", "nataliya", "natalia"],
+    "anna": ["hanna"],
+    "anastasia": ["anastasiia", "anastasiya"],
+    "maria": ["mariia", "mariya"],
+    "irina": ["iryna"],
+    "yelena": ["olena"],
+    "konstantin": ["kostiantyn"],
+    "denis": ["denys"],
+    "yevgeny": ["yevhen", "evgeny"],
+    "evgeny": ["yevhen", "yevgeny"],
+    "anton": ["anton"],
+    "stanislav": ["stanislav"],
+    "vladislav": ["vladyslav"],
+    "georgy": ["heorhii", "georgiy"],
+    "yelizaveta": ["yelyzaveta"],
+}
+
 def transliterate(text):
     """Simple 1:1 Cyrillic to Latin. Регина→Regina, Виктор→Viktor."""
     result = []
@@ -821,74 +905,131 @@ def transliterate(text):
             result.append(lat)
     return "".join(result)
 
+def name_variants(name):
+    """Return list of UA-style variants for a Russian-style transliterated name. Always includes the original."""
+    out = [name]
+    low = name.lower()
+    if low in NAME_VARIANTS_RU_TO_UA:
+        for v in NAME_VARIANTS_RU_TO_UA[low]:
+            cap = v[0].upper() + v[1:] if name and name[0].isupper() else v
+            if cap not in out:
+                out.append(cap)
+    return out
+
+def split_name_parts(query):
+    """Split 'Сергей Шепеленко' or 'Sergey Shepelenko' into [first, last]. Single token returns [query]."""
+    parts = [p for p in query.strip().split() if p]
+    return parts
+
 def is_cyrillic(text):
     return any("\u0400" <= ch <= "\u04ff" for ch in text)
 
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+", re.UNICODE)
+_PHONE_RE = re.compile(r"^\+?\d[\d\s().-]{6,}$")
+
+
 def search_hubspot_contacts(query, limit=20):
-    """Search HubSpot contacts by name, email, phone. Tries both Cyrillic and Latin."""
+    """Search HubSpot contacts by name, email, phone.
+
+    Strategy (cost-aware, max ~6 API calls):
+    1. Detect query kind: email / phone / name. Skip irrelevant branches.
+    2. Build minimal search-term set: original + transliterated + UA-firstname variants.
+    3. For multi-word names, do **lastname-only** filter (highest signal across cultures).
+    4. Short-circuit: stop adding filters once we have >=3 unique results.
+    """
     props = ["firstname", "lastname", "email", "phone", "company", "lifecyclestage",
              "hs_lead_status", "website", "jobtitle", "notes_last_updated"]
 
     all_results = {}
+    short_circuit_at = 3  # stop firing extra filters once we hit this many
 
-    # Search with original query
-    for search_term in [query]:
-        data = {"query": search_term.strip(), "properties": props, "limit": limit}
-        result = hubspot_request("POST", "/crm/v3/objects/contacts/search", data)
-        if "results" in result:
-            for c in result["results"]:
+    def _add_results(payload):
+        if isinstance(payload, dict) and "results" in payload:
+            for c in payload["results"]:
                 all_results[c["id"]] = c
 
-    # Also search with CONTAINS_TOKEN on firstname (catches partial matches)
-    for search_term in [query]:
+    def _query_search(term):
+        if not term:
+            return
+        data = {"query": term.strip(), "properties": props, "limit": limit}
+        _add_results(hubspot_request("POST", "/crm/v3/objects/contacts/search", data))
+
+    def _filter_search(prop, term):
+        if not term:
+            return
         data = {
             "filterGroups": [{"filters": [
-                {"propertyName": "firstname", "operator": "CONTAINS_TOKEN", "value": search_term.strip()}
+                {"propertyName": prop, "operator": "CONTAINS_TOKEN", "value": term.strip()}
             ]}],
             "properties": props, "limit": limit
         }
-        result = hubspot_request("POST", "/crm/v3/objects/contacts/search", data)
-        if "results" in result:
-            for c in result["results"]:
-                all_results[c["id"]] = c
+        _add_results(hubspot_request("POST", "/crm/v3/objects/contacts/search", data))
 
-    # If Cyrillic query, try Latin transliteration
-    if is_cyrillic(query):
-        variants = [transliterate(query)]
-        for variant in variants:
-            # query search
-            data = {"query": variant, "properties": props, "limit": limit}
-            result = hubspot_request("POST", "/crm/v3/objects/contacts/search", data)
-            if "results" in result:
-                for c in result["results"]:
-                    all_results[c["id"]] = c
-            # CONTAINS_TOKEN on firstname
-            data2 = {
-                "filterGroups": [{"filters": [
-                    {"propertyName": "firstname", "operator": "CONTAINS_TOKEN", "value": variant.strip()}
-                ]}],
-                "properties": props, "limit": limit
-            }
-            result2 = hubspot_request("POST", "/crm/v3/objects/contacts/search", data2)
-            if "results" in result2:
-                for c in result2["results"]:
-                    all_results[c["id"]] = c
+    q = query.strip()
 
-    # Also try lastname with all variants
-    search_terms = [query]
-    if is_cyrillic(query):
-        search_terms.append(transliterate(query))
-    for search_term in search_terms:
-        data = {
-            "filterGroups": [{"filters": [
-                {"propertyName": "lastname", "operator": "CONTAINS_TOKEN", "value": search_term.strip()}
-            ]}],
-            "properties": props, "limit": limit
-        }
-        result = hubspot_request("POST", "/crm/v3/objects/contacts/search", data)
-        if "results" in result:
-            for c in result["results"]:
-                all_results[c["id"]] = c
+    # === Branch 1: email lookup ===
+    if _EMAIL_RE.search(q):
+        _filter_search("email", q)
+        _query_search(q)
+        return list(all_results.values()), None
+
+    # === Branch 2: phone lookup ===
+    if _PHONE_RE.match(q):
+        _filter_search("phone", q)
+        _query_search(q)
+        return list(all_results.values()), None
+
+    # === Branch 3: name search ===
+    # Base term set: original + transliteration if Cyrillic.
+    base_terms = [q]
+    if is_cyrillic(q):
+        base_terms.append(transliterate(q))
+
+    # Split into firstname + lastname (where applicable). Use UA variants only on firstname slot.
+    firstname_candidates = set()
+    lastname_candidates = set()
+    composed_full = set(base_terms)
+
+    is_known_firstname = q.lower() in NAME_VARIANTS_RU_TO_UA
+    if is_cyrillic(q):
+        is_known_firstname = is_known_firstname or transliterate(q).lower() in NAME_VARIANTS_RU_TO_UA
+
+    for term in base_terms:
+        parts = split_name_parts(term)
+        if len(parts) >= 2:
+            firstname_candidates.add(parts[0])
+            lastname_candidates.add(parts[-1])
+            for variant in name_variants(parts[0]):
+                firstname_candidates.add(variant)
+                composed_full.add(f"{variant} {parts[-1]}")
+        elif len(parts) == 1:
+            for variant in name_variants(parts[0]):
+                firstname_candidates.add(variant)
+            # Single-word query: only treat as lastname if NOT a known firstname.
+            # Otherwise "Сергей" alone would search lastname=Sergey and produce false positives.
+            if not is_known_firstname:
+                for variant in name_variants(parts[0]):
+                    lastname_candidates.add(variant)
+
+    # 1. Full-text on the most likely full string (1-2 calls).
+    for term in composed_full:
+        _query_search(term)
+        if len(all_results) >= short_circuit_at:
+            break
+
+    # 2. Lastname-only filter (HIGHEST signal across cultures: Shepelenko = same regardless of firstname).
+    if len(all_results) < short_circuit_at:
+        for term in lastname_candidates:
+            _filter_search("lastname", term)
+            if len(all_results) >= short_circuit_at:
+                break
+
+    # 3. Firstname filter only if we still have nothing or too little.
+    if len(all_results) < short_circuit_at:
+        for term in firstname_candidates:
+            _filter_search("firstname", term)
+            if len(all_results) >= short_circuit_at:
+                break
 
     return list(all_results.values()), None
 
