@@ -10,6 +10,37 @@ import email.mime.text
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from anthropic import Anthropic
+
+# ---- Garage trigger detection (Engine agent 2026-05-09) --------------------
+_GARAGE_PATTERN_RAILWAY = re.compile(
+    r"(алло\s*,?\s*гараж|hello\s+garage|hey\s+garage)",
+    re.IGNORECASE | re.UNICODE,
+)
+
+_GARAGE_SYSTEM_CONTEXT_RAILWAY = (
+    "[GARAGE MODE]\n"
+    "You are the Garage specialist agent. Your domains:\n"
+    "- Cars: maintenance, specs, diagnostics, repair tips.\n"
+    "- Smart home: Home Assistant at http://100.106.1.80:8123, SwitchBot, Tapo, sensors.\n"
+    "- Devices: nucbox-m5pro (100.106.1.80), Daniel desktop (100.103.98.25).\n"
+    "- Networking: Tailscale mesh, WSL2, Docker, router config.\n"
+    "- Servers: Windows services, NSSM, scheduled tasks, processes.\n"
+    "Respond concisely. Note: this bot runs on Railway and cannot directly SSH or run local commands,\n"
+    "but can advise on all garage topics and draft commands for Daniel to run.\n\n"
+)
+
+
+def _detect_garage_railway(text):
+    words = text.strip().split()
+    prefix = " ".join(words[:3])
+    for candidate in ([prefix, text.strip()] if len(words) > 3 else [text.strip()]):
+        m = _GARAGE_PATTERN_RAILWAY.search(candidate)
+        if m:
+            payload = _GARAGE_PATTERN_RAILWAY.sub("", text.strip(), count=1).strip().lstrip(", .")
+            return True, payload
+    return False, text.strip()
+
+# ---------------------------------------------------------------------------
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 import urllib.request
@@ -1532,11 +1563,31 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _handle_text_inner(update, chat_id, text)
 
 
+_LI_PICK_PATTERN = re.compile(r'^\s*(\d+[ABCDabcd]|EDIT:.+|SKIP)\s*$', re.IGNORECASE)
+_LI_INBOX_PATH = r'C:\Users\tonko\OneDrive\Documents\linkedin-engage\inbox.jsonl'
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.username): return
     chat_id = update.effective_chat.id
     user_text = update.message.text
     if not user_text: return
+
+    # LinkedIn-engage pre-filter: route picks to file, skip AI handler
+    _msg_text = user_text.strip()
+    if _LI_PICK_PATTERN.match(_msg_text):
+        try:
+            with open(_LI_INBOX_PATH, 'a', encoding='utf-8') as _f:
+                _f.write(json.dumps({
+                    'ts': datetime.utcnow().isoformat(),
+                    'message_id': update.message.message_id,
+                    'chat_id': update.message.chat_id,
+                    'text': _msg_text
+                }, ensure_ascii=False) + '\n')
+            await update.message.reply_text(f"ack: {_msg_text} queued for LI engage")
+        except Exception as _e:
+            await update.message.reply_text(f"li-engage write failed: {_e}")
+        return
 
     fwd_username = None
     try:
@@ -1633,6 +1684,14 @@ async def _handle_text_inner(update, chat_id, user_text, fwd_username=None):
     if any(kw in tl for kw in cancel_kw):
         reply = await handle_cancel_schedule(update, chat_id, user_text)
         await update.message.reply_text(md_to_html(reply), parse_mode="HTML")
+        return
+
+    # Garage trigger: intercept before HubSpot/calendar enrichment matters
+    _is_garage_r, _garage_payload = _detect_garage_railway(user_text)
+    if _is_garage_r:
+        garage_text = _GARAGE_SYSTEM_CONTEXT_RAILWAY + (_garage_payload if _garage_payload else "Garage agent here. What do you need?")
+        logger.info("chat %s: garage trigger detected on Railway bot", chat_id)
+        await _process_message(update, chat_id, garage_text, fwd_username=fwd_username)
         return
 
     await _process_message(update, chat_id, user_text + extra, fwd_username=fwd_username)
