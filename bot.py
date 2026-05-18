@@ -2035,7 +2035,31 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"✅ Контакт <b>{esc(name)}</b> создан!\n<a href=\"{link}\">Открыть в HubSpot</a>",
                     parse_mode="HTML", disable_web_page_preview=True)
             else:
-                await q.edit_message_text(f"Ошибка создания: {str(r.get('message', r.get('error', '')))[:300]}")
+                err_msg = str(r.get("message", "") or r.get("error", ""))
+                m = re.search(r"Existing ID:\s*(\d+)", err_msg)
+                if m:
+                    existing_cid = m.group(1)
+                    existing_link = f"https://app.hubspot.com/contacts/47345195/record/0-1/{existing_cid}"
+                    d = pending["data"]
+                    name = f"{d.get('firstname', '')} {d.get('lastname', '')}".strip() or "—"
+                    tg_u = pending.get("tg_username")
+                    if tg_u:
+                        created_contacts[tg_u.lower()] = existing_cid
+                    if name and name != "—":
+                        created_contacts[name.lower()] = existing_cid
+                    email = d.get("email", "")
+                    if email:
+                        created_contacts[email.lower()] = existing_cid
+                    note = d.get("notes_initial")
+                    note_suffix = ""
+                    if note:
+                        nr = add_note_to_contact(existing_cid, note)
+                        note_suffix = "\n📝 Заметка добавлена." if "error" not in nr else ""
+                    await q.edit_message_text(
+                        f"⚠️ <b>{esc(name)}</b> уже есть в HubSpot.\n<a href=\"{existing_link}\">Открыть карточку</a>{note_suffix}",
+                        parse_mode="HTML", disable_web_page_preview=True)
+                else:
+                    await q.edit_message_text(f"Ошибка создания: {err_msg[:300]}")
         else:
             await q.edit_message_text("Отменено.")
 
@@ -2074,21 +2098,21 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if q.data == "cal_confirm":
             d = pending["data"]
             r = create_calendar_event(d["summary"], d["start"], d["end"], d.get("description", ""))
-            await q.edit_message_text(f"✅ Событие создано: {d['summary']}" if "error" not in r else f"Ошибка: {r.get('message','')[:300]}")
+            await q.edit_message_text(f"✅ Событие создано: {d['summary']}" if "error" not in r else f"Ошибка: {(r.get('message') or str(r.get('error') or '?'))[:300]}")
         else: await q.edit_message_text("Отменено.")
 
     elif t == "email":
         if q.data == "email_confirm":
             d = pending["data"]
             r = send_email(d["to"], d["subject"], d["body"])
-            await q.edit_message_text(f"✅ Письмо отправлено: {d['to']}" if "error" not in r else f"Ошибка: {r.get('message','')[:300]}")
+            await q.edit_message_text(f"✅ Письмо отправлено: {d['to']}" if "error" not in r else f"Ошибка: {(r.get('message') or str(r.get('error') or '?'))[:300]}")
         else: await q.edit_message_text("Отменено.")
 
     elif t == "draft":
         if q.data == "draft_confirm":
             d = pending["data"]
             r = save_draft(d.get("to", ""), d["subject"], d["body"])
-            await q.edit_message_text("💾 Черновик сохранён в Gmail." if "error" not in r else f"Ошибка: {r.get('message','')[:300]}")
+            await q.edit_message_text("💾 Черновик сохранён в Gmail." if "error" not in r else f"Ошибка: {(r.get('message') or str(r.get('error') or '?'))[:300]}")
         else: await q.edit_message_text("Отменено.")
 
     pending_updates.pop(chat_id, None)
