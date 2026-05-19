@@ -1564,7 +1564,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 _LI_PICK_PATTERN = re.compile(r'^\s*(\d+[ABCDabcd]|EDIT:.+|SKIP)\s*$', re.IGNORECASE)
-_LI_INBOX_PATH = r'C:\Users\tonko\OneDrive\Documents\linkedin-engage\inbox.jsonl'
+_LI_ENGAGE_URL = os.environ.get('LI_ENGAGE_URL', '').strip()
+_LI_ENGAGE_TOKEN = os.environ.get('LI_ENGAGE_TOKEN', '').strip()
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1573,20 +1574,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     if not user_text: return
 
-    # LinkedIn-engage pre-filter: route picks to file, skip AI handler
+    # LinkedIn-engage pre-filter: POST picks to Daniel's local listener (Tailscale Funnel)
     _msg_text = user_text.strip()
     if _LI_PICK_PATTERN.match(_msg_text):
+        if not _LI_ENGAGE_URL or not _LI_ENGAGE_TOKEN:
+            await update.message.reply_text("li-engage transport not configured (missing env)")
+            return
+        _payload = {
+            'ts': datetime.utcnow().isoformat(),
+            'message_id': update.message.message_id,
+            'chat_id': update.message.chat_id,
+            'text': _msg_text,
+        }
         try:
-            with open(_LI_INBOX_PATH, 'a', encoding='utf-8') as _f:
-                _f.write(json.dumps({
-                    'ts': datetime.utcnow().isoformat(),
-                    'message_id': update.message.message_id,
-                    'chat_id': update.message.chat_id,
-                    'text': _msg_text
-                }, ensure_ascii=False) + '\n')
-            await update.message.reply_text(f"ack: {_msg_text} queued for LI engage")
+            import httpx
+            async with httpx.AsyncClient(timeout=10.0) as _client:
+                _r = await _client.post(
+                    _LI_ENGAGE_URL,
+                    json=_payload,
+                    headers={'Authorization': f'Bearer {_LI_ENGAGE_TOKEN}'},
+                )
+            if _r.status_code == 200:
+                await update.message.reply_text(f"ack: {_msg_text} queued for LI engage")
+            else:
+                await update.message.reply_text(f"li-engage relay http {_r.status_code}")
         except Exception as _e:
-            await update.message.reply_text(f"li-engage write failed: {_e}")
+            await update.message.reply_text(f"li-engage relay failed: {_e}")
         return
 
     fwd_username = None
