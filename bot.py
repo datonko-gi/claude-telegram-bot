@@ -1563,7 +1563,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _handle_text_inner(update, chat_id, text)
 
 
-_LI_PICK_PATTERN = re.compile(r'^\s*(\d+[ABCDabcd]|EDIT:.+|SKIP)\s*$', re.IGNORECASE)
+_LI_PICK_PATTERN = re.compile(r'^\s*(GO|SKIP|EDIT:.+|\d+[ABCDabcd])\s*$', re.IGNORECASE)
 _LI_ENGAGE_URL = os.environ.get('LI_ENGAGE_URL', '').strip()
 _LI_ENGAGE_TOKEN = os.environ.get('LI_ENGAGE_TOKEN', '').strip()
 
