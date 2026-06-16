@@ -56,7 +56,7 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 HUBSPOT_API_KEY = os.environ.get("HUBSPOT_API_KEY", "")
 ALLOWED_USERS = os.environ.get("ALLOWED_USERS", "")
-MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6")
 MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "50"))
 
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
@@ -1348,7 +1348,7 @@ async def set_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
         MODEL = context.args[0]
         await update.message.reply_text(f"Модель: {MODEL}")
     else:
-        await update.message.reply_text("/setmodel claude-sonnet-4-20250514\n/setmodel claude-opus-4-20250514")
+        await update.message.reply_text("/setmodel claude-sonnet-4-6\n/setmodel claude-opus-4-8")
 
 
 async def find_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):

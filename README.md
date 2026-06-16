@@ -55,7 +55,7 @@ python bot.py
 | `TELEGRAM_BOT_TOKEN` | Токен от BotFather |
 | `ANTHROPIC_API_KEY` | Ключ Anthropic API |
 | `ALLOWED_USERS` | Кому разрешён доступ (username через запятую, пусто = все) |
-| `CLAUDE_MODEL` | Модель (default: claude-sonnet-4-20250514) |
+| `CLAUDE_MODEL` | Модель (default: claude-sonnet-4-6) |
 | `MAX_HISTORY` | Сколько сообщений хранить в контексте (default: 50) |
 
 ## Где запускать
