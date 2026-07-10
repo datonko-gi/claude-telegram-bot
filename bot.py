@@ -286,7 +286,7 @@ When user says "закрой задачу", "задача выполнена", "
 When user says "создай контакт", "добавь контакт", "create contact", "add contact" — IMMEDIATELY output hubspot_create tag.
 
 CRITICAL — DATA EXTRACTION:
-Before outputting the tag, carefully read ALL messages in the conversation (forwarded messages, copied text, user messages) and extract:
+Extract the person's data ONLY from the CURRENT request and the message(s) forwarded or pasted together with it. Each "создай контакт" is about a NEW person — NEVER carry a name, email, phone, or Telegram handle from an earlier or unrelated task still in the history. If the current message contains no name/data for the person, ASK for it; do NOT guess a name from earlier context. From the current message and its forward, extract:
 - firstname, lastname: from name mentions, "[FORWARDED from Name Surname]" headers, profile cards, Telegram contact cards
 - email: any @-containing address in the text (e.g. gagkp@mail.ru, andrkrupenko@gmail.com)
 - phone: any phone number in the text (e.g. 3233287890)
@@ -1181,21 +1181,37 @@ def complete_hubspot_task(task_id):
 
 # === TAG EXTRACTION ===
 
+def _tag_body(text, tag):
+    """Inner text of <tag>…</tag>. The model sometimes emits a malformed
+    closing tag (e.g. <hubspot_search>…</search>) or omits it entirely.
+    Prefer the well-formed match; otherwise capture up to the next tag or end
+    of string, so a model slip neither swallows the action (search/create
+    never runs) nor leaks the raw tag to the user."""
+    m = re.search(rf"<{tag}>\s*(.*?)\s*</{tag}>", text, re.DOTALL)
+    if not m:
+        m = re.search(rf"<{tag}>\s*(.*?)\s*(?:</[a-zA-Z_]+>|<[a-zA-Z_]+>|$)", text, re.DOTALL)
+    return m.group(1).strip() if m else None
+
 def extract_tag_json(text, tag):
-    match = re.search(rf"<{tag}>\s*(.*?)\s*</{tag}>", text, re.DOTALL)
-    if match:
-        try: return json.loads(match.group(1))
+    body = _tag_body(text, tag)
+    if body:
+        try: return json.loads(body)
         except: pass
     return None
 
 def extract_tag_text(text, tag):
-    match = re.search(rf"<{tag}>\s*(.*?)\s*</{tag}>", text, re.DOTALL)
-    return match.group(1).strip() if match else None
+    return _tag_body(text, tag)
+
+_CONTROL_TAGS = ("hubspot_update|hubspot_contact|hubspot_create|hubspot_search|hubspot_task|"
+                 "hubspot_edit|hubspot_deal|hubspot_complete_task|calendar_create|gmail_send|gmail_draft")
 
 def clean_response(text):
-    for tag in ["hubspot_update", "hubspot_contact", "hubspot_create", "hubspot_search", "hubspot_task",
-                "hubspot_edit", "hubspot_deal", "hubspot_complete_task", "calendar_create", "gmail_send", "gmail_draft"]:
-        text = re.sub(rf"<{tag}>.*?</{tag}>", "", text, flags=re.DOTALL)
+    # 1) well-formed <tag>…</tag> blocks
+    text = re.sub(rf"<({_CONTROL_TAGS})>.*?</\1>", "", text, flags=re.DOTALL)
+    # 2) malformed/unclosed: opening control tag + everything up to the next tag or end
+    text = re.sub(rf"<({_CONTROL_TAGS})>.*?(?=<|$)", "", text, flags=re.DOTALL)
+    # 3) orphaned / mismatched closing tags left behind (e.g. a stray </search>)
+    text = re.sub(rf"</(?:{_CONTROL_TAGS}|search)>", "", text)
     # Also strip [ATTACH:] markers from text shown to user; the bot will send
     # the actual file separately via reply_document. _extract_attachments()
     # in _process_message captures the paths before clean_response is called.
